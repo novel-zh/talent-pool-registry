@@ -1,94 +1,59 @@
-const fs=require('fs'),vm=require('vm'),crypto=require('crypto');
+const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),crypto=require('node:crypto'),assert=require('node:assert/strict');
+const source=fs.readFileSync(path.join(__dirname,'../Code.gs'),'utf8');
 const fixtures=require('./fixtures.cjs');
-const assert=(v,m)=>{if(!v)throw Error(m);};
-const expectError=(fn,part)=>{let error;try{fn();}catch(e){error=e;}assert(error&&(!part||error.message.includes(part)),'Expected error: '+part);};
-function display(v){if(v&&v.date)return v.date.slice(0,10).split('-').reverse().join('.');if(v instanceof Date)return v.toISOString().slice(0,10).split('-').reverse().join('.');if(typeof v==='string'&&v.startsWith("'="))return v.slice(1);return v==null?'':String(v);}
-class Range{
- constructor(s,r,c,n=1,m=1){Object.assign(this,{s,r,c,n,m});}
- map(fn){return Array.from({length:this.n},(_,i)=>Array.from({length:this.m},(_,j)=>fn(this.s.rows[this.r+i-1]?.[this.c+j-1])));}
- getDisplayValues(){return this.map(display);}getValues(){return this.map(v=>v&&v.date?new Date(v.date):typeof v==='string'&&v.startsWith("'=")?v.slice(1):v??'');}
- getFormulas(){return this.map(v=>typeof v==='string'&&v.startsWith('=')?v:'');}
- getValue(){return this.getValues()[0][0];}getFormula(){return this.getFormulas()[0][0];}
- canEdit(){return this.s.writable&&!Array.from({length:this.n},(_,i)=>Array.from({length:this.m},(_,j)=>`${this.r+i},${this.c+j}`)).flat().some(k=>this.s.protected.has(k));}
- setValue(v){if(!this.canEdit())throw Error('write denied');if(this.s.failOnce===`${this.r},${this.c}`){this.s.failOnce=null;throw Error('simulated write failure');}while(this.s.rows.length<this.r)this.s.rows.push([]);this.s.rows[this.r-1][this.c-1]=v;this.s.writes++;return this;}
- setValues(values){if(!this.canEdit())throw Error('write denied');if(this.s.failBatch==='before'){this.s.failBatch=null;throw Error('batch failed');}for(let i=0;i<this.n;i++){while(this.s.rows.length<this.r+i)this.s.rows.push([]);for(let j=0;j<this.m;j++)this.s.rows[this.r+i-1][this.c+j-1]=values[i][j];}this.s.writes++;if(this.s.failBatch==='after'){this.s.failBatch=null;throw Error('batch response lost');}return this;}
- clearContent(){if(this.s.failClear)throw Error('clear failed');return this.setValues(Array.from({length:this.n},()=>Array(this.m).fill('')));}
+let passed=0;
+const blank=v=>v===''||v==null;
+function formatDate(date,zone,pattern){const parts=Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:zone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(date).map(p=>[p.type,p.value]));return pattern==='yyyy-MM-dd'?`${parts.year}-${parts.month}-${parts.day}`:`${parts.day}.${parts.month}.${parts.year}`;}
+function harness(){
+  const stores=new Map();let user='alpha',writes=0,denied=false,locked=false;
+  const store=()=>{if(!stores.has(user))stores.set(user,{});const data=stores.get(user);return {getProperty:k=>data[k]??null,setProperty:(k,v)=>{data[k]=v;},deleteProperty:k=>{delete data[k];},getProperties:()=>({...data})};};
+  class Sheet{
+    constructor(data){Object.assign(this,{id:data.id,name:data.name,writable:true,maxRows:1000,protected:new Set(),fail:null,failClear:false});this.rows=data.rows.map(row=>row.map(v=>v&&typeof v==='object'&&!(v instanceof Date)?{...v}:{value:v}));}
+    cell(r,c){while(this.rows.length<r)this.rows.push([]);while(this.rows[r-1].length<c)this.rows[r-1].push({value:''});return this.rows[r-1][c-1];}
+    getSheetId(){return this.id;}getName(){return this.name;}getMaxRows(){return this.maxRows;}
+    getLastRow(){let n=this.rows.length;while(n&&!this.rows[n-1].some(c=>c&&(!blank(c.value)||c.formula)))n--;return n;}
+    getLastColumn(){return Math.max(0,...this.rows.map(row=>{let n=row.length;while(n&&(!row[n-1]||blank(row[n-1].value)&&!row[n-1].formula))n--;return n;}));}
+    insertRowsAfter(after,n){this.maxRows+=n;}
+    getRange(r,c,n=1,m=1){const sheet=this;const map=fn=>Array.from({length:n},(_,i)=>Array.from({length:m},(_,j)=>fn(sheet.rows[r+i-1]?.[c+j-1]||{value:''},r+i,c+j)));
+      return {getValues:()=>map(cell=>cell.value??''),getDisplayValues:()=>map(cell=>cell.display??(cell.value instanceof Date?formatDate(cell.value,'Asia/Qyzylorda','dd.MM.yyyy'):typeof cell.value==='boolean'?String(cell.value).toUpperCase():String(cell.value??''))),getFormulas:()=>map(cell=>cell.formula||''),
+        canEdit:()=>sheet.writable&&!map((cell,ri,ci)=>sheet.protected.has(`${ri},${ci}`)).flat().some(Boolean),
+        getValue:()=>sheet.cell(r,c).value??'',getFormula:()=>sheet.cell(r,c).formula||'',
+        setValue(value){if(!this.canEdit())throw Error('write denied');const failing=sheet.fail&&sheet.fail.cell===`${r},${c}`?sheet.fail:null;if(failing)sheet.fail=null;if(failing?.mode==='before')throw Error('simulated failure');
+          const cell=sheet.cell(r,c);cell.value=typeof value==='string'&&value.startsWith("'")?value.slice(1):value;cell.formula=typeof value==='string'&&value.startsWith('=')?value:'';delete cell.display;writes++;if(failing?.mode==='after')throw Error('lost response');return this;},
+        setValues(values){for(let i=0;i<n;i++)for(let j=0;j<m;j++)sheet.getRange(r+i,c+j).setValue(values[i][j]);return this;},
+        clearContent(){if(sheet.failClear)throw Error('clear failed');for(let i=0;i<n;i++)for(let j=0;j<m;j++)sheet.getRange(r+i,c+j).setValue('');return this;}
+      };
+    }
+  }
+  const books=fixtures().map(data=>({...data,sheets:data.sheets.map(s=>new Sheet(s)),getSheets(){return this.sheets;},getName(){return this.name;},getSpreadsheetTimeZone(){return 'Asia/Qyzylorda';},getUrl(){return 'https://docs.google.com/spreadsheets/d/'+this.id+'/edit';}}));
+  const ctx=vm.createContext({Date,console,Session:{getActiveUser:()=>({getEmail:()=>user+'@example.invalid'}),getEffectiveUser:()=>({getEmail:()=>user+'@example.invalid'})},PropertiesService:{getUserProperties:store},SpreadsheetApp:{openById:id=>{if(denied)throw Error('denied');const book=books.find(b=>b.id===id);if(!book)throw Error('missing');return book;},flush(){}},
+    LockService:{getScriptLock:()=>({waitLock(){assert(!locked);locked=true;},releaseLock(){locked=false;}})},
+    Utilities:{DigestAlgorithm:{SHA_256:'sha256'},Charset:{UTF_8:'utf8'},computeDigest:(algorithm,text)=>[...crypto.createHash('sha256').update(text).digest()],base64EncodeWebSafe:bytes=>Buffer.from(bytes).toString('base64url'),formatDate,
+      parseDate(text,zone,pattern){const [y,m,d]=text.split('-').map(Number);return new Date(Date.UTC(y,m-1,d)-5*3600000);}}
+  });
+  vm.runInContext(source,ctx);
+  return {ctx,books,main:books[0].sheets[0],connect:()=>ctx.connectSpreadsheet({url:books[0].getUrl()}),setUser:v=>{user=v;},setDenied:v=>{denied=v;},get writes(){return writes;},get locked(){return locked;},store};
 }
-class Sheet{
- constructor(x){this.name=x.name;this.rows=x.rows;this.writable=true;this.denied=false;this.protected=new Set();this.writes=0;this.maxColumns=Math.max(...x.rows.map(r=>r.length));this.maxRows=x.rows.length;}
- getName(){return this.name;}getRange(...args){return new Range(this,...args);}
- getLastRow(){let n=this.rows.length;while(n&&!this.rows[n-1].some(v=>v!==null&&v!==''&&v!==undefined))n--;return n;}
- getLastColumn(){return Math.max(0,...this.rows.map(row=>{let n=row.length;while(n&&(row[n-1]===null||row[n-1]===''||row[n-1]===undefined))n--;return n;}));}
- getMaxColumns(){return this.maxColumns;}insertColumnAfter(){this.maxColumns++;}
- getMaxRows(){return this.maxRows;}insertRowsAfter(after,n){this.maxRows+=n;while(this.rows.length<this.maxRows)this.rows.push([]);}
-}
-const sheets=fixtures.map(x=>new Sheet(x));
-const ids=['MAIN_FAKE_ID_0123456789','BKR_FAKE_ID_0123456789'];
-const props={MAIN_SPREADSHEET_URL:'https://docs.google.com/spreadsheets/d/'+ids[0]+'/edit',BKR_SPREADSHEET_URL:'https://docs.google.com/spreadsheets/d/'+ids[1]+'/edit'};
-const ctx=vm.createContext({Date,console:{log(){}},PropertiesService:{getScriptProperties:()=>({getProperty:k=>props[k]||null})},
- SpreadsheetApp:{openById:id=>{const i=ids.indexOf(id);if(i<0||sheets[i].denied)throw Error('read denied');return {getSheets:()=>[sheets[i]],getSheetByName:n=>sheets[i].name===n?sheets[i]:null,getSpreadsheetTimeZone:()=> 'Asia/Qyzylorda'};},flush(){}},
- LockService:{getScriptLock:()=>({waitLock(){},releaseLock(){}})},Utilities:{getUuid:()=>crypto.randomUUID(),DigestAlgorithm:{SHA_256:'sha256'},Charset:{UTF_8:'utf8'},computeDigest:(alg,str)=>[...crypto.createHash('sha256').update(str).digest()],base64EncodeWebSafe:bytes=>Buffer.from(bytes).toString('base64url'),formatDate:date=>date.toISOString().slice(0,10).split('-').reverse().join('.'),parseDate:str=>{const [d,m,y]=str.split('.').map(Number);return new Date(Date.UTC(y,m-1,d));}}});
-vm.runInContext(fs.readFileSync(require('path').join(__dirname,'../Code.gs'),'utf8'),ctx);
-expectError(()=>ctx.loadPersonnel(),'initializeEmployeeIds');
-const setup=ctx.initializeEmployeeIds();assert(setup.people===79&&setup.assigned===160,'ID setup and main-table list');
-assert(ctx.initializeEmployeeIds().assigned===0,'ID setup is idempotent');
-let result=ctx.loadPersonnel();assert(result.people.length===79,'Main-table records loaded');assert(result.people.filter(p=>p.hasBase&&p.hasAnalysis).length===79,'Shared IDs join 79 people');
-assert(result.unlinkedAnalysisCount===2,'BKR-only records counted without inventing main-table names');
-assert(result.people.every(p=>!('analysisName'in p)&&!('start2026'in p)&&!('end2026'in p)),'BKR name and level fields not returned');
-const person=result.people[0],id=person.id;
-const save=(source,changes,p=ctx.loadPersonnel().people.find(x=>x.id===id))=>ctx.savePersonnel({source,id,revision:source==='main'?p.revisionMain:p.revisionBkr,changes});
-sheets.forEach(s=>s.writable=false);result=ctx.loadPersonnel();assert(result.people.every(p=>!p.canEditMain&&!p.canEditBkr),'Reader sees no edit controls');expectError(()=>save('main',{email:'test@example.org'}),'Нет права');sheets.forEach(s=>s.writable=true);
-const bkrBefore=JSON.stringify(sheets[1].rows);
-save('main',{email:'test@example.org'},person);assert(ctx.loadPersonnel().people.find(p=>p.id===id).email==='test@example.org','Save writes source');assert(JSON.stringify(sheets[1].rows)===bkrBefore,'Other source preserved');
-expectError(()=>save('main',{email:'stale@example.org'},person),'уже изменена');
-const beforeInvalid=sheets[0].writes;expectError(()=>save('main',{email:'should-not-save@example.org',birth:'31.02.2001'}),'Некорректная дата');assert(sheets[0].writes===beforeInvalid,'Validate before any write');
-save('main',{birth:'01.02.1990'});assert(ctx.loadPersonnel().people.find(p=>p.id===id).birth==='01.02.1990','Typed birth date');
-expectError(()=>save('main',{unknownField:'value'}),'недоступно');
-// Sorting the source preserves identity and permits a safe save by stable ID.
-const prefix=sheets[0].rows.slice(0,4),data=sheets[0].rows.slice(4).reverse();sheets[0].rows=prefix.concat(data);save('main',{email:'sorted@example.org'});assert(ctx.loadPersonnel().people.find(p=>p.id===id).email==='sorted@example.org','Save after sort');
-let table=ctx.readTable_('main'),record=table.rows.find(r=>r.id===id);
-const noteCell=table.sheet.getRange(record.row,table.cols.mainNote+1);const oldNote=noteCell.getValue();noteCell.setValue('="computed"');expectError(()=>save('main',{mainNote:'overwrite'}),'формула');noteCell.setValue(oldNote);
-table=ctx.readTable_('main');record=table.rows.find(r=>r.id===id);const emailBefore=record.values.email;
-sheets[0].failOnce=`${record.row},${table.cols.mainNote+1}`;expectError(()=>save('main',{email:'partial@example.org',mainNote:'new note'}),'восстановлены');assert(ctx.loadPersonnel().people.find(p=>p.id===id).email===emailBefore,'Rollback restores earlier writes');
-save('main',{mainNote:'=SUM(1,2)'});table=ctx.readTable_('main');record=table.rows.find(r=>r.id===id);assert(record.values.mainNote==='=SUM(1,2)'&&!record.formulas.mainNote,'Input stays literal text');
-sheets[0].failOnce=`${record.row},${table.cols.email+1}`;expectError(()=>save('main',{mainNote:'replacement',email:'rollback@example.org'}),'восстановлены');table=ctx.readTable_('main');record=table.rows.find(r=>r.id===id);assert(record.values.mainNote==='=SUM(1,2)'&&!record.formulas.mainNote,'Rollback preserves literal text without formula execution');
-const bkrVersion=ctx.loadPersonnel().people.find(p=>p.id===id);sheets[0].denied=true;expectError(()=>save('bkr',{plan2027:'forbidden'},bkrVersion),'Не удалось открыть');sheets[0].denied=false;
-table=ctx.readTable_('main');const newRow=Array.from(sheets[0].rows[table.rows[0].row-1]);newRow[table.idCol]='';sheets[0].rows.push(newRow);const writes=sheets.reduce((n,s)=>n+s.writes,0);expectError(()=>ctx.initializeEmployeeIds(),'Неоднозначное ФИО');assert(sheets.reduce((n,s)=>n+s.writes,0)===writes,'Ambiguous names cause no writes');sheets[0].rows.pop();
-const cleanResult=ctx.loadPersonnel();
-
-// Unified editor validates both sources before writing and rolls back across files.
-const snapshots=()=>sheets.map(s=>JSON.stringify(s.rows));
-let p=ctx.loadPersonnel().people.find(p=>p.id===id);
-const update=sections=>ctx.updatePersonnel({id,sections});
-let versions={main:{revision:p.revisionMain,changes:{email:'unified@example.org'}},bkr:{revision:p.revisionBkr,changes:{plan2027:'Единая форма'}}};
-update(versions);p=ctx.loadPersonnel().people.find(p=>p.id===id);assert(p.email==='unified@example.org'&&p.plan2027==='Единая форма','Unified form saves both sources');
-let bt=ctx.readTable_('bkr'),br=bt.rows.find(r=>r.id===id);bt.sheet.getRange(br.row,bt.cols.goal+1).setValue('Changed externally');
-let before=snapshots();expectError(()=>update({main:{revision:p.revisionMain,changes:{email:'must-not-write@example.org'}},bkr:{revision:p.revisionBkr,changes:{plan2027:'stale'}}}),'уже изменена');assert(JSON.stringify(snapshots())===JSON.stringify(before),'Cross-source stale preflight prevents all writes');
-p=ctx.loadPersonnel().people.find(p=>p.id===id);sheets[1].failOnce=`${br.row},${bt.cols.plan2027+1}`;before=snapshots();
-expectError(()=>update({main:{revision:p.revisionMain,changes:{email:'rollback-new@example.org'}},bkr:{revision:p.revisionBkr,changes:{plan2027:'failure'}}}),'восстановлены');assert(JSON.stringify(snapshots())===JSON.stringify(before),'Unified save rollback spans both tables');
-p=ctx.loadPersonnel().people.find(p=>p.id===id);update({main:{revision:p.revisionMain,changes:{name:'ФИО из основного списка'}}});
-assert(ctx.loadPersonnel().people.find(p=>p.id===id).name==='ФИО из основного списка','Main name remains authoritative when BKR spelling differs');
-expectError(()=>save('bkr',{analysisName:'Wrong source'}),'недоступно');expectError(()=>save('bkr',{start2026:'9'}),'недоступно');
-// Creation needs only the name and writes one generated identity into both sources.
-const request=values=>({requestId:crypto.randomUUID(),values});
-const countWrites=()=>sheets.reduce((n,s)=>n+s.writes,0);
-let req=request({name:'Новый участник'}),created=ctx.createPersonnel(req);
-assert(created.created&&/^EMP-/.test(created.id),'Automatically assigned ID');
-const firstRows=['main','bkr'].map(k=>ctx.readTable_(k).rows.find(r=>r.id===created.id));
-assert(firstRows.every(Boolean)&&firstRows[0].values.name===firstRows[1].values.analysisName,'Name and same ID written to both sources');
-assert(firstRows[0].values.email===''&&firstRows[1].values.goal==='','Only name is mandatory');
-let writesBefore=countWrites();assert(!ctx.createPersonnel(req).created&&countWrites()===writesBefore,'Retry cannot create duplicate records');
-for(const invalid of [{name:' '},{name:'Bad',birth:'31.02.2000'},{name:'Bad',start2026:'4'},{name:'Bad',analysisName:'ignored?'}]){writesBefore=countWrites();expectError(()=>ctx.createPersonnel(request(invalid)));assert(countWrites()===writesBefore,'Invalid creation causes no writes');}
-sheets[1].writable=false;writesBefore=countWrites();expectError(()=>ctx.createPersonnel(request({name:'Forbidden'})),'Редактор');assert(countWrites()===writesBefore,'Both editor permissions required');sheets[1].writable=true;
-req=request({name:'Полная форма',region:'Новый город',email:'test@example.org',birth:'01.03.1995',level:'3',dec2025:'2',mainNote:'=SUM(1,2)',goal:'Цель',plan2027:'План'});created=ctx.createPersonnel(req);
-let added=ctx.loadPersonnel().people.find(p=>p.id===created.id);assert(added.region===added.analysisRegion&&added.birth==='01.03.1995'&&added.goal==='Цель','Optional fields routed to their source; initial region mirrored');
-assert(ctx.readTable_('main').rows.find(r=>r.id===created.id).formulas.mainNote==='','New text beginning equals cannot run as formula');
-for(const failure of ['before','after']){
- req=request({name:'Rollback '+failure});const counts=['main','bkr'].map(k=>ctx.readTable_(k).rows.length);sheets[1].failBatch=failure;
- expectError(()=>ctx.createPersonnel(req),'отменены');assert(['main','bkr'].every((k,i)=>ctx.readTable_(k).rows.length===counts[i]),'Creation rollback removes only new data on '+failure+' failure');
- assert(ctx.createPersonnel(req).created,'Same request safely retries after successful rollback');
-}
-req=request({name:'Partial write'});sheets[1].failBatch='before';sheets[0].failClear=true;expectError(()=>ctx.createPersonnel(req),'часть данных');sheets[0].failClear=false;
-expectError(()=>ctx.createPersonnel(req),'незавершённая');
-const partial=ctx.readTable_('main'),partialRow=partial.rows.find(r=>r.id==='EMP-'+req.requestId);partial.sheet.getRange(partialRow.row,1,1,partial.width).clearContent();
-console.log('Passed: main-only identity/levels, unchanged legacy fields, stable IDs, permissions, unified editor, stale preflight and cross-file rollback; name-only/full creation, mirrored identity, safe types, retries without duplicates and partial-failure handling.');
+function test(name,run){run(harness());passed++;console.log('PASS: '+name);}
+function payload(data,row,changes){return {schemaVersion:data.schemaVersion,rowNumber:row.rowNumber,revision:row.revision,changes};}
+test('connection discovers arbitrary headers, blank/duplicate names and data types without writes',h=>{
+  assert.equal(h.ctx.getInitialState().connected,false);const d=h.connect();assert.equal(d.headerRow,3);assert.equal(d.columns.length,9);assert.equal(d.rows.length,3);assert.equal(h.writes,0);
+  assert.equal(d.columns[2].type,'number');assert.equal(d.columns[3].type,'date');assert.equal(d.columns[4].type,'boolean');assert.equal(d.columns[5].type,'text');assert.equal(d.rows[0].values.c5,'00123');
+  assert.equal(d.columns[6].label,'Столбец G');assert.equal(d.columns[7].label,'Регион (2)');assert.equal(d.columns[1].filter,'category');assert.equal(d.columns[0].filter,'text');assert.equal(d.titleKey,'c0');
+  assert.equal(d.rows[1].typed.c2,0);assert.equal(d.rows[1].typed.c4,false);assert.equal(d.rows[2].typed.c3,'');assert.equal(d.rows[0].typed.c3,'2026-01-15');assert.deepEqual(JSON.parse(JSON.stringify(d.rows[0].formulaFields)),['c8']);assert(!JSON.stringify(d).includes('T00:00:00'));
+});
+test('connections and selected tabs are isolated per Google user',h=>{h.connect();h.setUser('beta');assert.equal(h.ctx.getInitialState().connected,false);h.ctx.connectSpreadsheet({url:h.books[1].getUrl()});h.setUser('alpha');assert.equal(h.ctx.getInitialState().spreadsheetName,h.books[0].name);h.ctx.disconnectSpreadsheet();assert.equal(h.ctx.getInitialState().connected,false);h.setUser('beta');assert.equal(h.ctx.getInitialState().connected,true);});
+test('owner execution and missing active identity fail before returning saved data',h=>{h.connect();h.ctx.Session.getEffectiveUser=()=>({getEmail:()=> 'owner@example.invalid'});assert.throws(()=>h.ctx.getInitialState(),/от имени/);h.ctx.Session.getActiveUser=()=>({getEmail:()=>''});assert.throws(()=>h.ctx.connectSpreadsheet({url:h.books[0].getUrl()}),/от имени/);assert.equal(h.writes,0);});
+test('duplicate-only and numeric column headings remain headers',h=>{h.main.rows=[[{value:'Регион'},{value:'Регион'}],[{value:'Астана'},{value:'Север'}]];let d=h.connect();assert.equal(d.headerRow,1);assert.equal(d.columns[1].label,'Регион (2)');h.main.rows=[[{value:2025},{value:2026}],[{value:5},{value:10}]];d=h.connect();assert.equal(d.headerRow,1);assert.equal(d.columns[0].label,'2025');});
+test('link gid chooses the requested sheet and switching rebuilds the schema',h=>{let d=h.ctx.connectSpreadsheet({url:h.books[0].getUrl()+'#gid=42'});assert.equal(d.columns[0].label,'Проект');assert.equal(d.sheetId,42);d=h.ctx.selectSheet({sheetId:0,headerRow:3});assert.equal(d.columns[0].label,'ФИО');assert.equal(d.headerMode,3);});
+test('invalid links, inaccessible and empty sheets never replace a valid connection',h=>{h.connect();for(const url of ['https://evil.example/?https://docs.google.com/spreadsheets/d/fake','https://docs.google.com.evil.example/spreadsheets/d/FAKE_LONG_DOCUMENT_ID','not a link'])assert.throws(()=>h.ctx.connectSpreadsheet({url}),/Вставьте ссылку/);assert.throws(()=>h.ctx.selectSheet({sheetId:99,headerRow:''}),/пуст/);assert.equal(h.ctx.getInitialState().sheetId,0);h.setDenied(true);assert.throws(()=>h.ctx.refreshDataset(),/доступ/);assert.equal(h.writes,0);});
+test('title and single-column sheets work, with manual header override available',h=>{h.main.rows=[[{value:'Only heading'}],[{value:'First value'}]];const d=h.connect();assert.equal(d.headerRow,1);assert.equal(d.columns.length,1);assert.equal(d.rows[0].values.c0,'First value');assert.equal(h.ctx.selectSheet({sheetId:0,headerRow:2}).rows.length,0);});
+test('explicit limits report partial data and reject excessive column counts',h=>{vm.runInContext('LIMITS_.rows=1',h.ctx);let d=h.connect();assert.equal(d.truncated,true);assert.equal(d.rows.length,1);vm.runInContext('LIMITS_.columns=2',h.ctx);assert.throws(()=>h.ctx.refreshDataset(),/столбцов/);});
+test('save writes typed values, preserves zero/false and quotes formula-like text',h=>{let d=h.connect(),row=d.rows[0];h.ctx.saveRow(payload(d,row,{c0:'=HYPERLINK("x")',c2:'0',c3:'2026-03-01',c4:'false'}));d=h.ctx.refreshDataset();assert.equal(d.rows[0].values.c0,'=HYPERLINK("x")');assert.equal(h.main.cell(4,1).formula,'');assert.equal(d.rows[0].typed.c2,0);assert.equal(d.rows[0].typed.c4,false);assert.equal(d.rows[0].typed.c3,'2026-03-01');assert(!h.locked);});
+test('all values validate before writing; formula cells and unknown columns are rejected',h=>{const d=h.connect(),row=d.rows[0];assert.throws(()=>h.ctx.saveRow(payload(d,row,{c0:'No write',c3:'2026-02-31'})),/дата/);assert.throws(()=>h.ctx.saveRow(payload(d,row,{c2:'NaN'})),/число/);assert.throws(()=>h.ctx.saveRow(payload(d,row,{c8:'123'})),/формул/);assert.throws(()=>h.ctx.saveRow(payload(d,row,{missing:'x'})),/столбец/);assert.equal(h.writes,0);assert(!h.locked);});
+test('stale edits, external row sorting and schema changes cannot overwrite another record',h=>{const d=h.connect(),row=d.rows[0];[h.main.rows[3],h.main.rows[4]]=[h.main.rows[4],h.main.rows[3]];assert.throws(()=>h.ctx.saveRow(payload(d,row,{c0:'Wrong person'})),/Строка изменена/);h.main.cell(3,1).value='Changed heading';assert.throws(()=>h.ctx.saveRow(payload(d,row,{c0:'Wrong schema'})),/Структура/);assert.equal(h.writes,0);});
+test('target permissions are rechecked and reader mode cannot append',h=>{const d=h.connect();h.main.writable=false;assert.equal(h.ctx.refreshDataset().canEdit,false);assert.throws(()=>h.ctx.saveRow(payload(d,d.rows[0],{c0:'Denied'})),/доступ/);assert.throws(()=>h.ctx.appendRow({schemaVersion:d.schemaVersion,requestId:crypto.randomUUID(),values:{c0:'Denied'}}),/редактированию/);assert.equal(h.writes,0);});
+test('partial write failures restore earlier and uncertain writes',h=>{const d=h.connect(),before=JSON.stringify(d.rows[0].values);h.main.fail={cell:'4,2',mode:'after'};assert.throws(()=>h.ctx.saveRow(payload(d,d.rows[0],{c0:'Changed',c1:'Changed region'})),/восстановлены/);assert.equal(JSON.stringify(h.ctx.refreshDataset().rows[0].values),before);});
+test('append retry is idempotent even after a different successful request',h=>{const d=h.connect(),a={schemaVersion:d.schemaVersion,requestId:crypto.randomUUID(),values:{c0:'New A',c2:'0',c4:'false'}},b={...a,requestId:crypto.randomUUID(),values:{c0:'New B'}};assert.equal(h.ctx.appendRow(a).created,true);assert.equal(h.ctx.appendRow(b).created,true);const writes=h.writes;assert.equal(h.ctx.appendRow(a).created,false);assert.equal(h.writes,writes);assert.equal(h.ctx.refreshDataset().rows.length,5);});
+test('append rolls back a partial failure and permits the same request to retry',h=>{const d=h.connect(),request={schemaVersion:d.schemaVersion,requestId:crypto.randomUUID(),values:{c0:'Retry participant',c2:'40'}};h.main.fail={cell:'8,2',mode:'after'};assert.throws(()=>h.ctx.appendRow(request),/отменено/);assert.equal(h.ctx.refreshDataset().rows.length,3);assert.equal(h.ctx.appendRow(request).created,true);assert.equal(h.ctx.refreshDataset().rows.length,4);});
+console.log(`\n${passed} backend regression groups passed.`);

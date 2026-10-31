@@ -1,0 +1,204 @@
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id), M = window.RegistryModel;
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const state = {data:null,filters:[],query:'',sortKey:'',direction:'asc',page:1,size:20,visible:new Set(),expanded:null,demo:false,busy:false,epoch:0,editing:null};
+  const hasServer = !!(window.google && google.script && google.script.run);
+  function rpc(method, payload) {
+    return new Promise((resolve,reject) => {
+      if (!hasServer) return reject(new Error('Для подключения своей таблицы откройте опубликованное веб-приложение. Здесь доступен пример.'));
+      const runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(error => reject(new Error(error.message || 'Не удалось выполнить запрос.')));
+      if (!['getInitialState','connectSpreadsheet','selectSheet','refreshDataset','disconnectSpreadsheet','saveRow','appendRow'].includes(method)) return reject(new Error('Неизвестная операция.'));
+      runner[method](payload);
+    });
+  }
+  function message(id,text) { $(id).textContent=text||''; $(id).hidden=!text; }
+  function busy(value) {
+    state.busy=value;
+    ['connect-button','refresh-button','apply-sheet','disconnect-button','add-button','sheet-select','header-row','source-url'].forEach(id => $(id).disabled=value);
+    document.querySelectorAll('[data-edit]').forEach(button => button.disabled=value);
+  }
+  function clearData() {
+    state.data=null;state.filters=[];state.query='';state.expanded=null;state.editing=null;
+    if ($('editor-dialog').open) $('editor-dialog').close();
+    ['table-head','table-body','mobile-list','filter-list','column-options','editor-fields','sheet-select'].forEach(id => $(id).replaceChildren());
+    ['dataset-title','dataset-meta','result-count','page-info'].forEach(id=>$(id).textContent='');$('source-link').removeAttribute('href');
+    $('workspace').hidden=true;$('connect-screen').hidden=false;$('mode-badge').hidden=true;$('search-input').value='';
+  }
+  function badge() {
+    $('mode-badge').hidden=false;$('mode-badge').textContent=state.demo?'Пример · вымышленные данные':state.data.canEdit?'Доступ: редактор':'Только просмотр';
+    $('mode-badge').className='pill'+(state.demo?' demo-badge':'');
+  }
+  function applyData(data) {
+    const old=state.data;
+    const changed=!old||old.sourceUrl!==data.sourceUrl||old.schemaVersion!==data.schemaVersion;
+    state.data=data;
+    if(changed){state.filters=[];state.query='';state.sortKey='';state.page=1;state.expanded=null;state.visible=new Set(data.columns.slice(0,6).map(c=>c.key));$('search-input').value='';}
+    else {state.filters=state.filters.filter(f=>data.columns.some(c=>c.key===f.key));state.visible=new Set([...state.visible].filter(key=>data.columns.some(c=>c.key===key)));}
+    if(!state.visible.size)state.visible.add(data.columns[0].key);
+    $('connect-screen').hidden=true;$('workspace').hidden=false;
+    $('dataset-title').textContent=data.spreadsheetName;
+    $('dataset-meta').textContent=data.sheetName+' · '+data.columns.length+' столбцов · заголовки в строке '+data.headerRow+' · обновлено '+new Date(data.loadedAt).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+    $('sheet-select').innerHTML=data.sheets.map(s=>`<option value="${s.id}"${s.id===data.sheetId?' selected':''}>${esc(s.name)}${s.empty?' (пустой)':''}</option>`).join('');
+    $('header-row').value=data.headerMode||'';
+    $('source-link').href=data.sourceUrl||'#';$('source-link').hidden=state.demo;
+    $('add-button').hidden=!data.canAdd;
+    message('limit-notice',data.truncated?'Загружена часть листа: '+data.rows.length+' непустых записей. Поиск и фильтры работают только по загруженной части. Для полного просмотра разделите большой лист.':'');
+    message('workspace-error','');badge();renderFilters();renderColumns();renderRows();
+  }
+  async function load(method,payload,success='') {
+    if(state.busy)return;
+    const ticket=++state.epoch;busy(true);message('connect-error','');message('workspace-error','');
+    $('connect-status').textContent='Читаем таблицу и определяем поля…';$('workspace-status').textContent='Обновляем данные…';
+    try {
+      const data=state.demo?demoRpc(method,payload):await rpc(method,payload);
+      if(ticket!==state.epoch)return;
+      if(data.connected)applyData(data);else clearData();
+      $('workspace-status').textContent=success; $('connect-status').textContent='';
+    } catch(error) {
+      if(ticket!==state.epoch)return;
+      clearData();message('connect-error',error.message);$('connect-status').textContent='';
+    } finally {if(ticket===state.epoch)busy(false);}
+  }
+  const visibleColumns=()=>state.data.columns.filter(c=>state.visible.has(c.key));
+  function display(row,col) {
+    if(M.empty(row.values[col.key]))return '<span class="muted">Не указано</span>';
+    return esc(col.type==='boolean'?row.typed[col.key]?'Да':'Нет':row.values[col.key]);
+  }
+  function details(row) {
+    return `<dl class="profile-grid">${state.data.columns.map(c=>`<div><dt>${esc(c.label)}${row.formulaFields.includes(c.key)?' · формула':''}</dt><dd>${display(row,c)}</dd></div>`).join('')}</dl>${state.data.canEdit?`<button type="button" data-edit="${row.rowNumber}"${state.busy?' disabled':''}>Редактировать запись</button>`:''}`;
+  }
+  function renderRows() {
+    if(!state.data)return;
+    const cols=visibleColumns(),filtered=M.filterRows(state.data,state.query,state.filters),sorted=M.sortRows(filtered,state.data.columns,state.sortKey,state.direction),page=M.pageRows(sorted,state.page,state.size);
+    state.page=page.page;
+    $('result-count').textContent='Найдено '+filtered.length+' из '+state.data.rows.length;
+    $('filter-count').textContent=state.filters.length?'('+state.filters.length+')':'';
+    $('empty-state').hidden=!!page.rows.length;
+    $('table-head').innerHTML='<tr><th><span class="muted">↳</span></th>'+cols.map(c=>`<th><button type="button" data-sort="${c.key}" aria-label="Сортировать: ${esc(c.label)}">${esc(c.label)}${state.sortKey===c.key?(state.direction==='asc'?' ↑':' ↓'):''}</button></th>`).join('')+'</tr>';
+    $('table-body').innerHTML=page.rows.map(row=>`<tr><td><button class="expand" type="button" data-expand="${row.rowNumber}" aria-label="Открыть запись ${row.rowNumber}" aria-expanded="${state.expanded===row.rowNumber}">${state.expanded===row.rowNumber?'−':'+'}</button></td>${cols.map(c=>`<td><span class="cell-text">${display(row,c)}</span></td>`).join('')}</tr>${state.expanded===row.rowNumber?`<tr class="detail-row"><td colspan="${cols.length+1}">${details(row)}</td></tr>`:''}`).join('');
+    const facts=state.data.columns.filter(c=>c.key!==state.data.titleKey).slice(0,4);
+    $('mobile-list').innerHTML=page.rows.map(row=>`<article class="mobile-card"><h3>${esc(row.values[state.data.titleKey]||'Запись '+row.rowNumber)}</h3><dl class="mobile-facts">${facts.map(c=>`<div><dt>${esc(c.label)}</dt><dd>${display(row,c)}</dd></div>`).join('')}</dl><button type="button" class="quiet" data-expand="${row.rowNumber}" aria-expanded="${state.expanded===row.rowNumber}">${state.expanded===row.rowNumber?'Свернуть':'Все поля →'}</button>${state.expanded===row.rowNumber?details(row):''}</article>`).join('');
+    $('page-info').textContent='Страница '+page.page+' из '+page.pages+' · '+filtered.length+' записей';
+    $('previous-page').disabled=page.page===1;$('next-page').disabled=page.page===page.pages;
+  }
+  function renderColumns() {
+    $('column-options').innerHTML=state.data.columns.map(c=>`<label><input type="checkbox" data-column="${c.key}"${state.visible.has(c.key)?' checked':''}>${esc(c.label)}</label>`).join('');
+  }
+  function initialFilter(key) {
+    const col=state.data.columns.find(c=>c.key===key);
+    return {key,op:col.filter==='text'?'contains':col.filter==='category'||col.filter==='boolean'?'is':'range',value:'',min:'',max:''};
+  }
+  function renderFilters() {
+    if(!state.data)return;
+    $('filters-empty').hidden=!!state.filters.length;
+    $('add-filter').disabled=state.filters.length>=state.data.columns.length;
+    $('filter-list').innerHTML=state.filters.map((f,i)=>{
+      const col=state.data.columns.find(c=>c.key===f.key),range=['number','date'].includes(col.filter),options=range?[['range','В диапазоне']]:col.filter==='text'?[['contains','Содержит']]:[['is','Равно']];
+      options.push(['empty','Не заполнено'],['notEmpty','Заполнено']);
+      let input='';
+      if(!['empty','notEmpty'].includes(f.op)){
+        if(range)input=`<input type="${col.filter==='date'?'date':'number'}" step="any" data-filter="${i}" data-part="min" aria-label="От: ${esc(col.label)}" placeholder="От" value="${esc(f.min)}"><input type="${col.filter==='date'?'date':'number'}" step="any" data-filter="${i}" data-part="max" aria-label="До: ${esc(col.label)}" placeholder="До" value="${esc(f.max)}">`;
+        else if(col.filter==='category'||col.filter==='boolean'){
+          const values=col.filter==='boolean'?[['true','Да'],['false','Нет']]:col.options.map(v=>[v,v]);
+          if(f.value&&!values.some(([v])=>v===f.value))values.push([f.value,f.value+' (нет в данных)']);
+          input=`<select data-filter="${i}" data-part="value" aria-label="Значение фильтра ${i+1}"><option value="">Все значения</option>${values.map(([v,label])=>`<option value="${esc(v)}"${f.value===v?' selected':''}>${esc(label)}</option>`).join('')}</select>`;
+        }else input=`<input data-filter="${i}" data-part="value" aria-label="Значение фильтра ${i+1}" placeholder="Введите текст" value="${esc(f.value)}">`;
+      }
+      return `<div class="filter-row"><select data-filter="${i}" data-part="key" aria-label="Столбец фильтра ${i+1}">${state.data.columns.map(c=>`<option value="${c.key}"${c.key===f.key?' selected':''}${state.filters.some((other,j)=>j!==i&&other.key===c.key)?' disabled':''}>${esc(c.label)}</option>`).join('')}</select><select data-filter="${i}" data-part="op" aria-label="Условие фильтра ${i+1}">${options.map(([v,label])=>`<option value="${v}"${f.op===v?' selected':''}>${label}</option>`).join('')}</select><div class="filter-values">${input}</div><button type="button" class="remove-filter" data-remove-filter="${i}" aria-label="Удалить фильтр ${i+1}">×</button></div>`;
+    }).join('');
+  }
+  function editorValue(row,col) {const value=col.type==='text'?row.values[col.key]:row.typed[col.key];return value===null||value===undefined?'':String(value);}
+  function openEditor(rowNumber) {
+    if(state.busy||!state.data)return;
+    const row=rowNumber?state.data.rows.find(r=>r.rowNumber===rowNumber):null;
+    if(row&&!state.data.canEdit||!row&&!state.data.canAdd)return;
+    state.editing={row,requestId:window.crypto?.randomUUID?.()||'request-'+Date.now()+'-'+Math.random().toString(36).slice(2),original:{}};
+    $('editor-title').textContent=row?'Редактировать запись':'Новая запись';
+    $('editor-hint').textContent=state.demo?'Демонстрация: изменения останутся только в этом окне.':'Сохранение изменит исходную Google Таблицу.';
+    $('editor-fields').innerHTML=state.data.columns.map(col=>{
+      const value=row?editorValue(row,col):'',formula=!!row&&row.formulaFields.includes(col.key);
+      state.editing.original[col.key]=value;
+      const attrs=`id="edit-${col.key}" data-editor="${col.key}"${formula?' disabled data-formula="true"':''}`,long=col.type==='text'&&(value.length>90||value.includes('\n'));
+      let input;
+      if(col.type==='boolean')input=`<select ${attrs}><option value="">Не указано</option><option value="true"${value==='true'?' selected':''}>Да</option><option value="false"${value==='false'?' selected':''}>Нет</option></select>`;
+      else if(long)input=`<textarea ${attrs} maxlength="30000">${esc(value)}</textarea>`;
+      else input=`<input ${attrs} type="${col.type==='number'?'number':col.type==='date'?'date':'text'}"${col.type==='number'?' step="any"':''} maxlength="30000" value="${esc(value)}">`;
+      return `<label${long?' class="wide"':''} for="edit-${col.key}">${esc(col.label)}${formula?'<span class="field-note"> · вычисляется формулой</span>':''}${input}</label>`;
+    }).join('');
+    message('editor-error','');$('editor-dialog').showModal();
+  }
+  function editorChanges() {
+    const values={};document.querySelectorAll('[data-editor]').forEach(input=>{if(!input.disabled&&input.value!==state.editing.original[input.dataset.editor])values[input.dataset.editor]=input.value;});return values;
+  }
+  function closeEditor() {
+    if(state.busy)return;
+    if(state.editing&&Object.keys(editorChanges()).length&&!confirm('Закрыть форму без сохранения изменений?'))return;
+    $('editor-dialog').close();state.editing=null;
+  }
+  async function saveEditor(event) {
+    event.preventDefault();if(state.busy||!state.editing)return;
+    const editing=state.editing,changes=editorChanges(),isNew=!editing.row;
+    if(!isNew&&!Object.keys(changes).length){$('editor-dialog').close();state.editing=null;return;}
+    const payload=isNew?{schemaVersion:state.data.schemaVersion,requestId:editing.requestId,values:changes}:{schemaVersion:state.data.schemaVersion,rowNumber:editing.row.rowNumber,revision:editing.row.revision,changes};
+    busy(true);['editor-submit','editor-close','editor-cancel'].forEach(id=>$(id).disabled=true);message('editor-error','');
+    document.querySelectorAll('[data-editor]').forEach(input=>input.disabled=true);
+    try {
+      if(state.demo)demoWrite(isNew,payload);else await rpc(isNew?'appendRow':'saveRow',payload);
+      $('editor-dialog').close();state.editing=null;
+      try {const data=state.demo?structuredClone(demoStore.find(d=>d.sheetId===state.data.sheetId)):await rpc('refreshDataset');applyData(data);$('workspace-status').textContent=isNew?'Запись добавлена.':'Изменения сохранены.';}
+      catch(error){clearData();message('connect-error','Запись сохранена, но обновление не удалось. '+error.message);}
+    }catch(error){message('editor-error',error.message);}
+    finally{busy(false);['editor-submit','editor-close','editor-cancel'].forEach(id=>$(id).disabled=false);document.querySelectorAll('[data-editor]').forEach(input=>input.disabled=input.dataset.formula==='true');}
+  }
+  function toggle(buttonId,panelId) {const open=$(panelId).hidden;$(panelId).hidden=!open;$(buttonId).setAttribute('aria-expanded',String(open));}
+  $('connect-form').addEventListener('submit',event=>{event.preventDefault();state.demo=false;load('connectSpreadsheet',{url:$('source-url').value});});
+  $('refresh-button').addEventListener('click',()=>load('refreshDataset',null,'Данные обновлены.'));
+  $('apply-sheet').addEventListener('click',()=>load('selectSheet',{sheetId:Number($('sheet-select').value),headerRow:$('header-row').value}));
+  $('disconnect-button').addEventListener('click',async()=>{
+    if(state.busy)return;
+    const demo=state.demo;++state.epoch;clearData();state.demo=false;busy(true);
+    try{if(!demo)await rpc('disconnectSpreadsheet');$('source-url').focus();}catch(error){message('connect-error',error.message);}finally{busy(false);}
+  });
+  $('source-settings-button').addEventListener('click',()=>toggle('source-settings-button','source-settings'));
+  $('filters-button').addEventListener('click',()=>toggle('filters-button','filters-panel'));
+  $('columns-button').addEventListener('click',()=>toggle('columns-button','column-panel'));
+  $('search-input').addEventListener('input',event=>{state.query=event.target.value;state.page=1;renderRows();});
+  $('add-filter').addEventListener('click',()=>{const next=state.data.columns.find(c=>!state.filters.some(f=>f.key===c.key));if(next){state.filters.push(initialFilter(next.key));state.page=1;renderFilters();renderRows();}});
+  $('clear-filters').addEventListener('click',()=>{state.filters=[];state.query='';state.page=1;$('search-input').value='';renderFilters();renderRows();});
+  $('filter-list').addEventListener('click',event=>{const button=event.target.closest('[data-remove-filter]');if(button){state.filters.splice(Number(button.dataset.removeFilter),1);state.page=1;renderFilters();renderRows();}});
+  function changeFilter(event){const el=event.target;if(!el.hasAttribute('data-filter'))return;const i=Number(el.dataset.filter),part=el.dataset.part;
+    if(part==='key'){state.filters[i]=initialFilter(el.value);renderFilters();}else{state.filters[i][part]=el.value;if(part==='op')renderFilters();}state.page=1;renderRows();}
+  $('filter-list').addEventListener('input',event=>{if(event.target.tagName==='INPUT')changeFilter(event);});
+  $('filter-list').addEventListener('change',event=>{if(event.target.tagName==='SELECT')changeFilter(event);});
+  $('column-options').addEventListener('change',event=>{const key=event.target.dataset.column;if(!key)return;if(event.target.checked)state.visible.add(key);else if(state.visible.size>1)state.visible.delete(key);else event.target.checked=true;renderRows();});
+  $('workspace').addEventListener('click',event=>{const expand=event.target.closest('[data-expand]'),edit=event.target.closest('[data-edit]'),sort=event.target.closest('[data-sort]');if(expand){const row=Number(expand.dataset.expand);state.expanded=state.expanded===row?null:row;renderRows();}if(edit)openEditor(Number(edit.dataset.edit));if(sort){state.direction=state.sortKey===sort.dataset.sort&&state.direction==='asc'?'desc':'asc';state.sortKey=sort.dataset.sort;renderRows();}});
+  $('page-size').addEventListener('change',()=>{state.size=Number($('page-size').value);state.page=1;renderRows();});
+  $('previous-page').addEventListener('click',()=>{state.page--;renderRows();});$('next-page').addEventListener('click',()=>{state.page++;renderRows();});
+  $('add-button').addEventListener('click',()=>openEditor(null));$('editor-form').addEventListener('submit',saveEditor);
+  ['editor-close','editor-cancel'].forEach(id=>$(id).addEventListener('click',closeEditor));$('editor-dialog').addEventListener('cancel',event=>{event.preventDefault();closeEditor();});
+  window.addEventListener('scroll',()=>{$('back-top').hidden=window.scrollY<500;},{passive:true});$('back-top').addEventListener('click',()=>window.scrollTo({top:0,behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'}));
+
+  // Explicit, fictional in-memory demo. Never substitutes for a failed real connection.
+  function makeDemo() {
+    const labels=[['ФИО','text','text'],['Регион','text','category'],['Направление','text','category'],['Баллы','number','number'],['Дата включения','date','date'],['Обучение завершено','boolean','boolean'],['План развития','text','category']];
+    const columns=labels.map(([label,type,filter],i)=>({key:'c'+i,index:i,label,sourceHeader:label,type,filter,options:[]}));
+    const regions=['Астана','Алматы','Караганда','Шымкент'],tracks=['Управление','Проекты','Образование'];
+    const rows=Array.from({length:38},(_,i)=>{const score=48+(i*7)%53,date='2026-'+String(1+i%9).padStart(2,'0')+'-15',done=i%3===0;
+      return {rowNumber:i+2,revision:'demo-'+i,values:{c0:'Участник '+String(i+1).padStart(2,'0'),c1:regions[i%4],c2:tracks[i%3],c3:String(score),c4:date.split('-').reverse().join('.'),c5:done?'TRUE':'FALSE',c6:i%5===0?'':'Практика и обучение'},typed:{c3:score,c4:date,c5:done},formulaFields:[]};});
+    columns.filter(c=>c.filter==='category').forEach(c=>c.options=[...new Set(rows.map(r=>r.values[c.key]).filter(Boolean))]);
+    const sheets=[{id:0,name:'Кадровый резерв',empty:false},{id:1,name:'Другие столбцы',empty:false}];
+    const base={connected:true,spreadsheetName:'Кадровый резерв · пример',sourceUrl:'demo:0',sheets,sheetId:0,sheetName:sheets[0].name,headerRow:1,headerMode:0,columns,rows,titleKey:'c0',schemaVersion:'demo-main',canEdit:true,canAdd:true,physicalDataRows:38,truncated:false,loadedAt:new Date().toISOString()};
+    const alt={...base,sourceUrl:'demo:1',sheetId:1,sheetName:sheets[1].name,schemaVersion:'demo-other',columns:[{key:'c0',index:0,label:'Проект',sourceHeader:'Проект',type:'text',filter:'text',options:[]},{key:'c1',index:1,label:'Статус',sourceHeader:'Статус',type:'text',filter:'category',options:['В работе','Завершён']}],rows:[{rowNumber:2,revision:'alt-1',values:{c0:'Пример проекта',c1:'В работе'},typed:{},formulaFields:[]}]};
+    return [base,alt];
+  }
+  let demoStore=makeDemo();
+  function demoRpc(method,payload){if(method==='selectSheet'){const next=demoStore.find(d=>d.sheetId===payload.sheetId);if(!next)throw new Error('Лист не найден.');return structuredClone(next);}return structuredClone(demoStore.find(d=>d.sheetId===state.data.sheetId));}
+  function demoWrite(isNew,payload){const data=demoStore.find(d=>d.sheetId===state.data.sheetId);let row=isNew?{rowNumber:Math.max(1,...data.rows.map(r=>r.rowNumber))+1,revision:'demo-new',values:Object.fromEntries(data.columns.map(c=>[c.key,''])),typed:{},formulaFields:[]}:data.rows.find(r=>r.rowNumber===payload.rowNumber);
+    Object.entries(isNew?payload.values:payload.changes).forEach(([key,value])=>{const col=data.columns.find(c=>c.key===key);if(col.type==='number'){row.typed[key]=value===''?'':Number(value);row.values[key]=value;}else if(col.type==='date'){row.typed[key]=value;row.values[key]=value?value.split('-').reverse().join('.'):'';}else if(col.type==='boolean'){row.typed[key]=value===''?'':value==='true';row.values[key]=value===''?'':value==='true'?'TRUE':'FALSE';}else row.values[key]=value;});
+    if(isNew){if(Object.values(row.values).every(M.empty))throw new Error('Заполните хотя бы одно поле.');data.rows.push(row);}data.loadedAt=new Date().toISOString();}
+  $('demo-button').addEventListener('click',()=>{++state.epoch;busy(false);state.demo=true;demoStore=makeDemo();state.data=null;applyData(structuredClone(demoStore[0]));$('workspace-status').textContent='Это вымышленные данные. Изменения не сохраняются в Google Таблицах.';});
+  if(hasServer)load('getInitialState');else $('connect-status').textContent='Для своей таблицы откройте опубликованное приложение. Пример работает прямо здесь.';
+})();
+</script>

@@ -1,366 +1,238 @@
-/** Реестр специалистов. Персональные данные хранятся только в Google Таблицах. */
-const ID_HEADER_ = 'Сотрудник_ID';
-const SCHEMA_ = {
-  main: {
-    property: 'MAIN_SPREADSHEET_URL', tabProperty: 'MAIN_TAB_NAME', nameKey: 'name',
-    fields: {
-      number: ['Nr.', '№'], level: ['Stufe'], name: ['Name'], region: ['Region'],
-      trackDE: ['Entwicklungstrack'], activity: ['Fachrichtung und Tätigkeit'],
-      dec2025: ['Eingruppierung Stufe 30.12.2025'],
-      jun2026: ['Eingruppierung Stufe 30.06.2026'],
-      dec2026: ['Eingruppierung Stufe 30.12.2026'],
-      birth: ['Geburtsdatum'], phone: ['Kontaktnummer'], email: ['E-Mail'],
-      mainNote: ['Empfehlung/ Kommentare'], future: ['Zukunftige Entwiclung', 'Zukünftige Entwicklung'],
-      track: ['Трек']
-    }
-  },
-  bkr: {
-    property: 'BKR_SPREADSHEET_URL', tabProperty: 'BKR_TAB_NAME', nameKey: 'analysisName',
-    fields: {
-      analysisNumber: ['№'], analysisName: ['ФИО участника'], analysisRegion: ['Регион'],
-      goal: ['Цель участника (через 5 лет)'], recommendation: ['Рекомендация (РО/РП/ИБ)'],
-      training: ['Обучения/проекты за 2026 г.'], plan2027: ['План на 2027 г. (рекомендации)']
-    }
-  }
-};
+/** Adaptive registry; each accessing user owns their connection settings. */
+const CONNECTION_KEY_ = 'ADAPTIVE_REGISTRY_CONNECTION_V1';
+const LIMITS_ = {rows: 5000, columns: 100, cells: 100000, characters: 2000000};
 
 function doGet() {
-  return HtmlService.createHtmlOutputFromFile('Index')
-    .setTitle('Реестр специалистов')
-    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  return HtmlService.createTemplateFromFile('Index').evaluate()
+    .setTitle('Реестр кадрового резерва').addMetaTag('viewport', 'width=device-width, initial-scale=1');
 }
-
-/** Запустить при настройке и для строк, добавленных напрямую в таблицы. */
-function initializeEmployeeIds() {
-  const lock = LockService.getScriptLock();
-  lock.waitLock(15000);
-  try {
-    const tables = [readTable_('main'), readTable_('bkr')];
-    tables.forEach(t => {
-      assertUniqueIds_(t, false);
-      if (!t.sheet.getRange(1, 1, Math.max(t.sheet.getLastRow(), 1), Math.max(t.sheet.getLastColumn(), 1)).canEdit()) {
-        throw new Error('Для назначения ID нужен доступ «Редактор» к обеим таблицам.');
-      }
-    });
-    const counts = tables.map(t => countNames_(t));
-    const known = new Map();
-    tables.forEach(t => t.rows.forEach(r => {
-      if (!r.id) return;
-      const key = normalize_(r.values[SCHEMA_[t.kind].nameKey]);
-      if (!known.has(key)) known.set(key, new Set());
-      known.get(key).add(r.id);
-    }));
-    const newIds = new Map();
-    const assignments = [];
-    tables.forEach((t, ti) => t.rows.forEach(r => {
-      if (r.id) return;
-      const key = normalize_(r.values[SCHEMA_[t.kind].nameKey]);
-      if (counts[0].get(key) > 1 || counts[1].get(key) > 1 || (known.has(key) && known.get(key).size > 1)) {
-        throw new Error('Неоднозначное ФИО в строке ' + r.row + ' листа «' + t.sheet.getName() + '». Назначьте различным людям разные Сотрудник_ID вручную; одному человеку в двух таблицах — одинаковый ID.');
-      }
-      const existing = known.has(key) ? Array.from(known.get(key))[0] : null;
-      if (!existing && !newIds.has(key)) newIds.set(key, 'EMP-' + Utilities.getUuid());
-      assignments.push({table: ti, row: r.row, id: existing || newIds.get(key)});
-    }));
-    // Все проверки закончены до первой записи. Существующие ID не меняются.
-    tables.forEach((t, ti) => {
-      if (t.idCol < 0) {
-        t.idCol = t.sheet.getLastColumn();
-        if (t.idCol >= t.sheet.getMaxColumns()) t.sheet.insertColumnAfter(t.sheet.getMaxColumns());
-        t.sheet.getRange(t.headerRow, t.idCol + 1).setValue(ID_HEADER_);
-      }
-      assignments.filter(a => a.table === ti).forEach(a => t.sheet.getRange(a.row, t.idCol + 1).setValue(a.id));
-    });
-    SpreadsheetApp.flush();
-    const result = loadPersonnel();
-    console.log('Настройка завершена. Людей: ' + result.people.length + '. Новых ID в строках: ' + assignments.length + '.');
-    return {people: result.people.length, assigned: assignments.length};
-  } finally { lock.releaseLock(); }
+function include_(name) {
+  if (!['Model', 'Client'].includes(name)) throw new Error('Неизвестный компонент.');
+  return HtmlService.createHtmlOutputFromFile(name).getContent();
 }
-
-/** Проверка настроек из редактора; в журнал выводится только число записей. */
-function checkConnection() {
-  const result = loadPersonnel();
-  console.log('Подключение работает. Людей: ' + result.people.length + '.');
-  return {people: result.people.length};
+function getInitialState() { const c = connection_(); return c ? readDataset_(c) : {connected: false}; }
+function refreshDataset() { return readDataset_(requireConnection_()); }
+function disconnectSpreadsheet() {
+  assertUserContext_();
+  PropertiesService.getUserProperties().deleteProperty(CONNECTION_KEY_);
+  return {connected: false};
 }
-
-/** Вызывается интерфейсом от имени вошедшего пользователя. Без общего кэша. */
-function loadPersonnel() {
-  const main = readTable_('main');
-  const bkr = readTable_('bkr');
-  assertUniqueIds_(main, true);
-  assertUniqueIds_(bkr, true);
-  const mainEditable = tableEditable_(main);
-  const bkrEditable = tableEditable_(bkr);
-  const merged = new Map();
-  function initial(id) {
-    const p = {id: id, hasBase: false, hasAnalysis: false, canEditMain: false, canEditBkr: false};
-    Object.keys(SCHEMA_.main.fields).concat(Object.keys(SCHEMA_.bkr.fields)).forEach(k => p[k] = '');
-    return p;
+function connectSpreadsheet(request) {
+  assertUserContext_();
+  const source = parseSource_(request && request.url), book = openBook_(source.id), sheets = book.getSheets();
+  const sheet = source.gid === null ? sheets.find(s => s.getLastRow() && s.getLastColumn()) || sheets[0]
+    : sheets.find(s => s.getSheetId() === source.gid);
+  if (!sheet) throw new Error('Лист из ссылки не найден. Скопируйте ссылку на нужный лист ещё раз.');
+  const c = {spreadsheetId: source.id, sheetId: sheet.getSheetId(), headerRow: 0};
+  const result = readDataset_(c, book);
+  PropertiesService.getUserProperties().setProperty(CONNECTION_KEY_, JSON.stringify(c));
+  return result;
+}
+function selectSheet(request) {
+  const current = requireConnection_(), id = Number(request && request.sheetId);
+  const header = request && request.headerRow !== '' && request.headerRow != null ? Number(request.headerRow) : 0;
+  if (!Number.isInteger(id) || id < 0 || !Number.isInteger(header) || header < 0 || header > 30) {
+    throw new Error('Проверьте лист и строку заголовков: 1–30 или «Авто».');
   }
-  main.rows.forEach(r => {
-    const p = initial(r.id);
-    Object.assign(p, r.values, {hasBase: true, canEditMain: mainEditable, revisionMain: revision_(r)});
-    merged.set(r.id, p);
+  const next = {spreadsheetId: current.spreadsheetId, sheetId: id, headerRow: header};
+  const result = readDataset_(next);
+  PropertiesService.getUserProperties().setProperty(CONNECTION_KEY_, JSON.stringify(next));
+  return result;
+}
+function connection_() {
+  assertUserContext_();
+  const saved = PropertiesService.getUserProperties().getProperty(CONNECTION_KEY_);
+  if (!saved) return null;
+  try {
+    const c = JSON.parse(saved);
+    if (!/^[a-zA-Z0-9_-]{15,}$/.test(c.spreadsheetId) || !Number.isInteger(c.sheetId) ||
+        !Number.isInteger(c.headerRow) || c.headerRow < 0 || c.headerRow > 30) throw new Error();
+    return c;
+  } catch (e) { throw new Error('Подключение повреждено. Подключите таблицу заново.'); }
+}
+function requireConnection_() { const c = connection_(); if (!c) throw new Error('Сначала подключите Google Таблицу.'); return c; }
+function assertUserContext_() {
+  const active = Session.getActiveUser().getEmail(), effective = Session.getEffectiveUser().getEmail();
+  if (!active || !effective || active.toLowerCase() !== effective.toLowerCase()) {
+    throw new Error('Приложение должно работать от имени открывающего его пользователя. Проверьте параметр «Выполнять от имени» в развёртывании Apps Script и войдите в Google-аккаунт.');
+  }
+}
+function parseSource_(value) {
+  const text = String(value || '').trim();
+  if (/^[a-zA-Z0-9_-]{15,}$/.test(text)) return {id: text, gid: null};
+  const match = text.match(/^https:\/\/docs\.google\.com\/spreadsheets\/(?:u\/\d+\/)?d\/([a-zA-Z0-9_-]{15,})(?:[/?#].*)?$/i);
+  if (!match) throw new Error('Вставьте ссылку https://docs.google.com/spreadsheets/d/… или ID Google Таблицы.');
+  const gid = (text.match(/[?#&]gid=(\d+)(?:[&#]|$)/) || [])[1];
+  return {id: match[1], gid: gid === undefined ? null : Number(gid)};
+}
+function openBook_(id) {
+  try { return SpreadsheetApp.openById(id); }
+  catch (e) { throw new Error('Не удалось открыть таблицу. Проверьте ссылку, Google-аккаунт и доступ. Нужен формат Google Таблиц, а не Excel.'); }
+}
+function normalize_(v) { return String(v == null ? '' : v).normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase(); }
+function isEmpty_(v) { return v === '' || v === null || v === undefined; }
+function isDate_(v) { return Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime()); }
+function findHeader_(display, raw) {
+  const first = display.findIndex(row => row.some(v => String(v).trim()));
+  if (first < 0) throw new Error('Лист пуст. Добавьте названия столбцов.');
+  // Prefer the first plausible multi-column heading over a merged document title.
+  for (let i = first; i < display.length; i++) {
+    if (display[i].filter(v => String(v).trim()).length >= 2) return i + 1;
+  }
+  return first + 1;
+}
+function inferColumn_(label, values, display) {
+  const nonempty = values.filter(v => !isEmpty_(v));
+  const identifier = /(^|[\s_])(id|ид|иин|iin|код|номер|№|телефон|phone|контакт|email|e-mail|nr\.?)([\s_]|$)/i.test(label);
+  let type = 'text';
+  if (!identifier && nonempty.length) {
+    if (nonempty.every(isDate_)) type = 'date';
+    else if (nonempty.every(v => typeof v === 'boolean')) type = 'boolean';
+    else if (nonempty.every(v => typeof v === 'number' && Number.isFinite(v))) type = 'number';
+  }
+  const options = Array.from(new Set(display.filter(v => String(v).trim()).map(String)));
+  const name = /(^|\s)(фио|фамилия|имя|name|surname|full name)(\s|$)/i.test(label);
+  const filter = type !== 'text' ? type : options.length && options.length <= 30 && options.every(v => v.length <= 100) && !name ? 'category' : 'text';
+  return {type: type, filter: filter, options: filter === 'category' ? options.sort((a,b) => a.localeCompare(b, 'ru')) : []};
+}
+function digest_(value) {
+  return Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, JSON.stringify(value), Utilities.Charset.UTF_8));
+}
+function rowRevision_(raw, formulas, schema) { return digest_([schema, raw.map(v => isDate_(v) ? {date: v.toISOString()} : v), formulas]); }
+function columnLetter_(n) { let text = ''; while (n) { n--; text = String.fromCharCode(65 + n % 26) + text; n = Math.floor(n / 26); } return text; }
+
+function readDataset_(c, suppliedBook) {
+  const book = suppliedBook || openBook_(c.spreadsheetId), sheet = book.getSheets().find(s => s.getSheetId() === c.sheetId);
+  if (!sheet) throw new Error('Подключённый лист удалён. Подключите таблицу заново.');
+  const width = sheet.getLastColumn(), height = sheet.getLastRow();
+  if (!width || !height) throw new Error('Лист пуст. Добавьте строку с названиями столбцов.');
+  if (width > LIMITS_.columns) throw new Error('Больше ' + LIMITS_.columns + ' столбцов. Подготовьте отдельный лист с нужными данными.');
+  const top = sheet.getRange(1, 1, Math.min(20, height), width);
+  const headerRow = c.headerRow || findHeader_(top.getDisplayValues(), top.getValues());
+  if (headerRow > height) throw new Error('Строка заголовков находится за пределами данных.');
+  const headers = sheet.getRange(headerRow, 1, 1, width).getDisplayValues()[0];
+  const count = Math.min(Math.max(0, height - headerRow), LIMITS_.rows, Math.floor(LIMITS_.cells / width));
+  const range = count ? sheet.getRange(headerRow + 1, 1, count, width) : null;
+  const sourceRaw = range ? range.getValues() : [], sourceDisplay = range ? range.getDisplayValues() : [], sourceFormulas = range ? range.getFormulas() : [];
+  const raw = [], display = [], formulas = [], rowNumbers = [];
+  let characters = 0, payloadLimited = false;
+  for (let i = 0; i < sourceDisplay.length; i++) {
+    const size = sourceDisplay[i].reduce((n,v) => n + String(v).length, 0);
+    if (characters + size > LIMITS_.characters) { payloadLimited = true; break; }
+    characters += size;
+    if (sourceRaw[i].every(isEmpty_) && sourceDisplay[i].every(isEmpty_)) continue;
+    raw.push(sourceRaw[i]); display.push(sourceDisplay[i].map(String)); formulas.push(sourceFormulas[i]); rowNumbers.push(headerRow + 1 + i);
+  }
+  const timezone = book.getSpreadsheetTimeZone(), names = new Map(), columns = [];
+  for (let i = 0; i < width; i++) {
+    const header = String(headers[i] || '').trim();
+    if (!header && !raw.some(row => !isEmpty_(row[i])) && !display.some(row => row[i])) continue;
+    const base = header || 'Столбец ' + columnLetter_(i + 1), number = (names.get(normalize_(base)) || 0) + 1;
+    names.set(normalize_(base), number);
+    // Suffixes are based on physical column position; keys never use user-controlled headers.
+    let label = base + (number > 1 ? ' (' + number + ')' : '');
+    while (columns.some(col => col.label === label)) label += ' · ' + columnLetter_(i + 1);
+    columns.push(Object.assign({key: 'c' + i, index: i, label: label, sourceHeader: header}, inferColumn_(label, raw.map(r => r[i]), display.map(r => r[i]))));
+  }
+  if (!columns.length) throw new Error('Столбцы не найдены. Выберите строку заголовков вручную.');
+  const schemaVersion = digest_([sheet.getSheetId(), headerRow, headers, columns.map(col => [col.key, col.type])]);
+  const canEdit = sheet.getRange(headerRow, 1, Math.max(1, count + 1), width).canEdit();
+  const rows = raw.map((row, ri) => {
+    const values = {}, typed = {}, formulaFields = [];
+    columns.forEach(col => {
+      const value = row[col.index]; values[col.key] = display[ri][col.index];
+      if (col.type === 'date') typed[col.key] = isDate_(value) ? Utilities.formatDate(value, timezone, 'yyyy-MM-dd') : '';
+      else if (col.type === 'number' || col.type === 'boolean') typed[col.key] = isEmpty_(value) ? '' : value;
+      if (formulas[ri][col.index]) formulaFields.push(col.key);
+    });
+    return {rowNumber: rowNumbers[ri], revision: rowRevision_(row, formulas[ri], schemaVersion), values: values, typed: typed, formulaFields: formulaFields};
   });
-  bkr.rows.forEach(r => {
-    const p = merged.get(r.id);
-    if (!p) return; // Состав списка и ФИО определяются только основной таблицей.
-    const values = Object.assign({}, r.values);
-    delete values.analysisName;
-    Object.assign(p, values, {hasAnalysis: true, canEditBkr: bkrEditable, revisionBkr: revision_(r)});
-  });
-  const people = Array.from(merged.values());
-  people.forEach(p => delete p.analysisName);
-  return {people: people, canCreate: mainEditable && bkrEditable,
-    unlinkedAnalysisCount: bkr.rows.filter(r => !merged.has(r.id)).length,
-    loadedAt: new Date().toISOString()};
+  const title = columns.find(col => /^(фио|фамилия|имя|name|full name|участник|сотрудник)$/i.test(col.sourceHeader)) || columns[0];
+  return {connected: true, spreadsheetName: book.getName(), sourceUrl: book.getUrl() + '#gid=' + sheet.getSheetId(),
+    sheets: book.getSheets().map(s => ({id: s.getSheetId(), name: s.getName(), empty: !s.getLastRow() || !s.getLastColumn()})),
+    sheetId: sheet.getSheetId(), sheetName: sheet.getName(), headerRow: headerRow, headerMode: c.headerRow,
+    columns: columns, rows: rows, titleKey: title.key, schemaVersion: schemaVersion, canEdit: canEdit, canAdd: canEdit,
+    physicalDataRows: Math.max(0, height - headerRow), truncated: count < height - headerRow || payloadLimited, loadedAt: new Date().toISOString()};
 }
-
-function tableEditable_(table) {
-  return table.sheet.getRange(table.headerRow, 1, Math.max(1, table.sheet.getLastRow() - table.headerRow + 1), table.width).canEdit();
-}
-
-/** Сохраняется один раздел/источник за раз, по постоянному ID, с проверкой версии. */
-function savePersonnel(request) {
-  if (!request || !['main', 'bkr'].includes(request.source) || typeof request.id !== 'string' || !request.changes || typeof request.changes !== 'object') {
-    throw new Error('Некорректный запрос сохранения. Обновите страницу.');
+function typedInput_(col, value, timezone) {
+  const text = String(value == null ? '' : value);
+  if (text.length > 30000) throw new Error('Поле «' + col.label + '» длиннее 30 000 символов.');
+  if (text === '') return '';
+  if (col.type === 'number') {
+    if (!text.trim() || !Number.isFinite(Number(text))) throw new Error('Поле «' + col.label + '»: укажите число.');
+    return Number(text);
   }
-  const lock = LockService.getScriptLock();
-  lock.waitLock(15000);
-  try {
-    // Основная таблица — точка проверки допуска ко всему приложению, в том числе при записи БКР.
-    const main = readTable_('main');
-    const table = request.source === 'main' ? main : readTable_('bkr');
-    assertUniqueIds_(table, true);
-    const record = table.rows.find(r => r.id === request.id);
-    if (!record) throw new Error('Запись удалена или её ID изменился. Нажмите «Обновить данные».');
-    if (request.revision !== revision_(record)) throw new Error('Запись уже изменена в таблице или другим пользователем. Обновите данные перед редактированием.');
-    const changes = prepareChanges_(table, record, request.changes);
-    writeChanges_(changes);
-    return {saved: changes.length};
-  } finally { lock.releaseLock(); }
-}
-
-/** Сохранить единую форму; оба раздела проверяются до первой записи. */
-function updatePersonnel(request) {
-  if (!request || typeof request.id !== 'string' || !request.sections || typeof request.sections !== 'object') {
-    throw new Error('Некорректный запрос сохранения. Обновите страницу.');
+  if (col.type === 'boolean') {
+    if (value === true || text === 'true') return true;
+    if (value === false || text === 'false') return false;
+    throw new Error('Поле «' + col.label + '»: выберите Да или Нет.');
   }
-  const keys = Object.keys(request.sections);
-  if (!keys.length || keys.some(k => !['main', 'bkr'].includes(k))) throw new Error('Некорректные разделы записи.');
-  const lock = LockService.getScriptLock();
-  lock.waitLock(15000);
-  try {
-    const tables = {main: readTable_('main'), bkr: readTable_('bkr')};
-    Object.values(tables).forEach(t => assertUniqueIds_(t, true));
-    if (!tables.main.rows.some(r => r.id === request.id)) throw new Error('Участник отсутствует в основном списке. Обновите данные.');
-    let changes = [];
-    keys.forEach(kind => {
-      const section = request.sections[kind], table = tables[kind];
-      if (!section || !section.changes || typeof section.changes !== 'object') throw new Error('Некорректные поля записи.');
-      const record = table.rows.find(r => r.id === request.id);
-      if (!record) throw new Error('Запись раздела удалена. Обновите данные.');
-      if (section.revision !== revision_(record)) throw new Error('Запись уже изменена в таблице или другим пользователем. Обновите данные перед редактированием.');
-      changes = changes.concat(prepareChanges_(table, record, section.changes));
-    });
-    writeChanges_(changes);
-    return {saved: changes.length};
-  } finally { lock.releaseLock(); }
-}
-
-function typedValue_(key, text, table) {
-  if (text.length > 30000) throw new Error('Слишком длинное значение поля.');
-  if (key === 'birth' && text) {
-    if (!/^\d{2}\.\d{2}\.\d{4}$/.test(text)) throw new Error('Дата рождения: используйте формат ДД.ММ.ГГГГ.');
+  if (col.type === 'date') {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) throw new Error('Поле «' + col.label + '»: выберите дату.');
     let date;
-    try { date = Utilities.parseDate(text, table.timeZone, 'dd.MM.yyyy'); } catch (e) { throw new Error('Некорректная дата рождения.'); }
-    if (Utilities.formatDate(date, table.timeZone, 'dd.MM.yyyy') !== text) throw new Error('Некорректная дата рождения.');
+    try { date = Utilities.parseDate(text, timezone, 'yyyy-MM-dd'); } catch (e) { throw new Error('Некорректная дата.'); }
+    if (Utilities.formatDate(date, timezone, 'yyyy-MM-dd') !== text) throw new Error('Некорректная дата.');
     return date;
   }
-  if (['number', 'analysisNumber', 'level'].includes(key) && /^\d+(?:\.\d+)?$/.test(text)) return Number(text);
-  return text.startsWith('=') ? "'" + text : text;
+  return /^[=+\-@]/.test(text) ? "'" + text : text;
 }
-
-function prepareChanges_(table, record, input) {
-    const changes = [];
-    Object.keys(input).forEach(key => {
-      if (key === 'analysisName' || !Object.prototype.hasOwnProperty.call(SCHEMA_[table.kind].fields, key) || table.cols[key] === undefined) {
-        throw new Error('Поле недоступно для изменения: ' + key);
-      }
-      const text = String(input[key] == null ? '' : input[key]).trim();
-      if (text.length > 30000) throw new Error('Слишком длинное значение поля.');
-      if (text === record.values[key]) return;
-      if (key === 'name' && !text) throw new Error('ФИО не может быть пустым.');
-      const cell = table.sheet.getRange(record.row, table.cols[key] + 1);
-      if (!cell.canEdit()) throw new Error('Нет права редактировать этот раздел или поле защищено.');
-      if (cell.getFormula()) throw new Error('В этом поле находится формула. Измените её непосредственно в таблице.');
-      changes.push({cell: cell, value: typedValue_(key, text, table), oldValue: cell.getValue(), oldFormula: cell.getFormula()});
-    });
-    return changes;
-}
-
-function writeChanges_(changes) {
-    const applied = [];
-    try {
-      changes.forEach(c => { applied.push(c); c.cell.setValue(c.value); });
-      SpreadsheetApp.flush();
-    } catch (e) {
-      let restored = true;
-      applied.reverse().forEach(c => {
-        try {
-          const oldLiteral = typeof c.oldValue === 'string' && c.oldValue.startsWith('=') ? "'" + c.oldValue : c.oldValue;
-          c.cell.setValue(c.oldFormula || oldLiteral);
-        } catch (restoreError) { restored = false; }
-      });
-      try { SpreadsheetApp.flush(); } catch (restoreError) { restored = false; }
-      throw new Error(restored ? 'Не удалось сохранить. Предыдущие значения восстановлены. Обновите страницу и проверьте права.' : 'Сохранение прервалось. Часть полей могла измениться. Проверьте запись в исходной таблице.');
-    }
-}
-
-/** Создать участника в обоих источниках с одним автоматически назначенным ID. */
-function createPersonnel(request) {
-  if (!request || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request.requestId || '') || !request.values || typeof request.values !== 'object') {
-    throw new Error('Некорректный запрос добавления. Откройте форму заново.');
-  }
-  const lock = LockService.getScriptLock();
-  lock.waitLock(15000);
+function saveRow(request) {
+  const lock = LockService.getScriptLock(); lock.waitLock(15000);
   try {
-    const tables = [readTable_('main'), readTable_('bkr')];
-    tables.forEach(t => {
-      assertUniqueIds_(t, true);
-      if (!tableEditable_(t)) throw new Error('Для добавления участника нужен доступ «Редактор» к обеим таблицам.');
+    const c = requireConnection_(), book = openBook_(c.spreadsheetId), data = readDataset_(c, book);
+    if (!request || request.schemaVersion !== data.schemaVersion || !Number.isInteger(request.rowNumber)) throw new Error('Структура таблицы изменилась. Обновите данные.');
+    const record = data.rows.find(row => row.rowNumber === request.rowNumber);
+    if (!record || record.revision !== request.revision) throw new Error('Строка изменена, перемещена или удалена. Обновите данные перед сохранением.');
+    if (!request.changes || typeof request.changes !== 'object' || Array.isArray(request.changes)) throw new Error('Некорректные поля записи.');
+    const sheet = book.getSheets().find(s => s.getSheetId() === c.sheetId);
+    const changes = Object.keys(request.changes).map(key => {
+      const col = data.columns.find(column => column.key === key);
+      if (!col) throw new Error('Неизвестный столбец.');
+      const cell = sheet.getRange(request.rowNumber, col.index + 1);
+      if (!cell.canEdit()) throw new Error('Нет доступа к полю «' + col.label + '».');
+      if (cell.getFormula()) throw new Error('Поле «' + col.label + '» вычисляется формулой.');
+      return {cell: cell, original: cell.getValue(), value: typedInput_(col, request.changes[key], book.getSpreadsheetTimeZone())};
     });
-    // Один запрос формы всегда получает один ID: повтор после потери ответа не создаёт дубль.
-    const id = 'EMP-' + request.requestId.toLowerCase();
-    const existing = tables.map(t => t.rows.find(r => r.id === id));
-    if (existing.every(Boolean)) return {id: id, created: false};
-    if (existing.some(Boolean)) throw new Error('Обнаружена незавершённая запись в одной таблице. Проверьте обе таблицы для ID ' + id + ' перед повторным добавлением.');
-    const values = {};
-    const allowed = Object.keys(SCHEMA_.main.fields).concat(Object.keys(SCHEMA_.bkr.fields)).filter(k => !['analysisName', 'number', 'analysisNumber'].includes(k));
-    Object.keys(request.values).forEach(key => {
-      if (!allowed.includes(key)) throw new Error('Поле недоступно для добавления: ' + key);
-      values[key] = String(request.values[key] == null ? '' : request.values[key]).trim();
-      if (values[key].length > 30000) throw new Error('Слишком длинное значение поля.');
-    });
-    if (!values.name) throw new Error('Укажите ФИО участника.');
-    values.analysisName = values.name;
-    if (!values.analysisRegion) values.analysisRegion = values.region || '';
-    const plans = tables.map(t => {
-      const row = new Array(t.width).fill('');
-      Object.keys(SCHEMA_[t.kind].fields).forEach(key => {
-        if (t.cols[key] === undefined) {
-          if (values[key]) throw new Error('Не найден столбец для поля ' + key + '. Проверьте заголовки таблицы.');
-          return;
-        }
-        const value = ['number', 'analysisNumber'].includes(key)
-          ? String(t.rows.reduce((max, r) => Math.max(max, /^\d+$/.test(r.values[key] || '') ? Number(r.values[key]) : 0), 0) + 1)
-          : values[key] || '';
-        row[t.cols[key]] = typedValue_(key, value, t);
-      });
-      row[t.idCol] = id;
-      return {table: t, rowNumber: t.sheet.getLastRow() + 1, values: row};
-    });
-    // Права и значения проверены для обоих источников до записи участника.
-    plans.forEach(p => {
-      const sheet = p.table.sheet;
-      if (p.rowNumber > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), p.rowNumber - sheet.getMaxRows());
-      p.range = sheet.getRange(p.rowNumber, 1, 1, p.table.width);
-      if (!p.range.canEdit()) throw new Error('Новая строка защищена. Проверьте права на обе таблицы.');
-      if (p.range.getValues()[0].some(v => v !== '') || p.range.getFormulas()[0].some(Boolean)) throw new Error('Строка для добавления уже занята. Повторите попытку.');
-    });
-    const attempted = [];
-    try {
-      plans.forEach(p => { attempted.push(p); p.range.setValues([p.values]); });
-      SpreadsheetApp.flush();
-    } catch (error) {
-      let restored = true;
-      attempted.reverse().forEach(p => {
-        try {
-          const current = p.range.getValues()[0];
-          if (current[p.table.idCol] === id) p.range.clearContent();
-          else if (current.some(v => v !== '')) restored = false;
-        } catch (restoreError) { restored = false; }
-      });
-      try { SpreadsheetApp.flush(); } catch (restoreError) { restored = false; }
-      throw new Error(restored ? 'Не удалось добавить участника. Записанные данные отменены. Проверьте подключение и повторите попытку.' : 'Добавление прервалось. Проверьте обе таблицы для ID ' + id + ': часть данных могла сохраниться.');
+    const applied = [];
+    try { changes.forEach(change => { applied.push(change); change.cell.setValue(change.value); }); SpreadsheetApp.flush(); }
+    catch (error) {
+      let incomplete = false;
+      applied.reverse().forEach(change => { try { const v = change.original; change.cell.setValue(typeof v === 'string' && /^[=+\-@]/.test(v) ? "'" + v : v); } catch (e) { incomplete = true; } });
+      throw new Error(incomplete ? 'Сбой записи. Откат не завершён: проверьте строку в Google Таблице.' : 'Не удалось сохранить. Исходные значения восстановлены.');
     }
-    return {id: id, created: true};
+    return {saved: changes.length};
   } finally { lock.releaseLock(); }
 }
-
-function normalize_(value) { return String(value == null ? '' : value).normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase(); }
-function headerKey_(value) { return normalize_(value).replace(/\s/g, ''); }
-function countNames_(table) {
-  const map = new Map();
-  table.rows.forEach(r => { const key = normalize_(r.values[SCHEMA_[table.kind].nameKey]); map.set(key, (map.get(key) || 0) + 1); });
-  return map;
-}
-function readTable_(kind) {
-  const schema = SCHEMA_[kind];
-  const props = PropertiesService.getScriptProperties();
-  const configured = (props.getProperty(schema.property) || '').trim();
-  const id = (configured.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/) || [])[1] || (/^[a-zA-Z0-9_-]{15,}$/.test(configured) ? configured : '');
-  if (!id) throw new Error('В настройках проекта добавьте свойство ' + schema.property + ' со ссылкой на Google Таблицу.');
-  let book;
-  try { book = SpreadsheetApp.openById(id); } catch (e) {
-    throw new Error('Не удалось открыть ' + schema.property + '. Проверьте Google-аккаунт, доступ и что файл сохранён в формате Google Таблиц, а не Excel.');
-  }
-  const tabName = (props.getProperty(schema.tabProperty) || '').trim();
-  const sheets = tabName ? [book.getSheetByName(tabName)].filter(Boolean) : book.getSheets();
-  if (!sheets.length) throw new Error('Лист «' + tabName + '» не найден. Проверьте ' + schema.tabProperty + '.');
-  const candidates = [];
-  sheets.forEach(sheet => {
-    const width = sheet.getLastColumn(), height = sheet.getLastRow();
-    if (!width || !height) return;
-    const headers = sheet.getRange(1, 1, Math.min(height, 10), width).getDisplayValues();
-    headers.forEach((row, ri) => {
-      const cols = {};
-      Object.keys(schema.fields).forEach(key => {
-        const aliases = schema.fields[key].map(headerKey_);
-        const positions = row.map((v, ci) => aliases.includes(headerKey_(v)) ? ci : -1).filter(ci => ci >= 0);
-        if (positions.length > 1) throw new Error('Повторяется заголовок поля ' + key + ' на листе «' + sheet.getName() + '».');
-        if (positions.length) cols[key] = positions[0];
-      });
-      const regionKey = kind === 'main' ? 'region' : 'analysisRegion';
-      if (cols[schema.nameKey] === undefined || cols[regionKey] === undefined) return;
-      const idCol = row.findIndex(v => headerKey_(v) === headerKey_(ID_HEADER_));
-      candidates.push({sheet: sheet, headerRow: ri + 1, cols: cols, idCol: idCol, width: width});
-    });
-  });
-  if (candidates.length !== 1) throw new Error('Не удалось однозначно найти заголовки ' + kind + '. Проверьте названия столбцов или задайте ' + schema.tabProperty + '.');
-  const t = candidates[0];
-  Object.assign(t, {kind: kind, timeZone: book.getSpreadsheetTimeZone(), rows: []});
-  const n = t.sheet.getLastRow() - t.headerRow;
-  if (n <= 0) return t;
-  const range = t.sheet.getRange(t.headerRow + 1, 1, n, t.width);
-  const display = range.getDisplayValues(), raw = range.getValues(), formulas = range.getFormulas();
-  display.forEach((row, index) => {
-    if (!String(row[t.cols[schema.nameKey]] || '').trim()) return;
-    const values = {}, rowFormulas = {};
-    Object.keys(schema.fields).forEach(key => {
-      const col = t.cols[key];
-      values[key] = col === undefined ? '' : String(row[col] == null ? '' : row[col]).trim();
-      if (key === 'birth' && col !== undefined && Object.prototype.toString.call(raw[index][col]) === '[object Date]') {
-        values[key] = Utilities.formatDate(raw[index][col], t.timeZone, 'dd.MM.yyyy');
-      }
-      rowFormulas[key] = col === undefined ? '' : formulas[index][col];
-    });
-    t.rows.push({row: t.headerRow + 1 + index, id: t.idCol < 0 ? '' : String(row[t.idCol] || '').trim(), values: values, formulas: rowFormulas});
-  });
-  return t;
-}
-function assertUniqueIds_(table, required) {
-  if (required && table.idCol < 0) throw new Error('Сначала запустите initializeEmployeeIds из редактора Apps Script.');
-  const seen = new Set();
-  table.rows.forEach(r => {
-    if (!r.id) { if (required) throw new Error('Нет Сотрудник_ID в строке ' + r.row + ' листа «' + table.sheet.getName() + '». Администратору нужно запустить initializeEmployeeIds.'); return; }
-    if (seen.has(r.id)) throw new Error('Повторяется Сотрудник_ID на листе «' + table.sheet.getName() + '». У разных людей должны быть разные ID.');
-    seen.add(r.id);
-  });
-}
-function revision_(record) {
-  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, JSON.stringify({id: record.id, values: record.values, formulas: record.formulas}), Utilities.Charset.UTF_8);
-  return Utilities.base64EncodeWebSafe(bytes);
+function appendRow(request) {
+  const lock = LockService.getScriptLock(); lock.waitLock(15000);
+  try {
+    const c = requireConnection_(), book = openBook_(c.spreadsheetId), data = readDataset_(c, book);
+    if (!request || request.schemaVersion !== data.schemaVersion) throw new Error('Структура таблицы изменилась. Обновите данные.');
+    if (!data.canAdd) throw new Error('Для добавления нужен доступ к редактированию листа.');
+    if (!/^[a-zA-Z0-9-]{16,80}$/.test(String(request.requestId || ''))) throw new Error('Некорректный номер запроса.');
+    const props = PropertiesService.getUserProperties(), key = 'APPEND_V1_' + digest_([c.spreadsheetId, c.sheetId, request.requestId]);
+    const saved = props.getProperty(key);
+    if (saved) { const old = JSON.parse(saved); if (old.state !== 'done') throw new Error('Предыдущая попытка не завершена. Проверьте строку ' + old.row + ' в таблице.'); return {created: false, rowNumber: old.row}; }
+    if (!request.values || typeof request.values !== 'object' || Array.isArray(request.values)) throw new Error('Некорректные поля записи.');
+    const keys = Object.keys(request.values);
+    if (keys.some(key => !data.columns.some(col => col.key === key))) throw new Error('Неизвестный столбец.');
+    const sheet = book.getSheets().find(s => s.getSheetId() === c.sheetId), rowNumber = sheet.getLastRow() + 1;
+    const values = Array(sheet.getLastColumn()).fill('');
+    keys.forEach(key => { const col = data.columns.find(column => column.key === key); values[col.index] = typedInput_(col, request.values[key], book.getSpreadsheetTimeZone()); });
+    if (values.every(isEmpty_)) throw new Error('Заполните хотя бы одно поле.');
+    if (rowNumber > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), 1);
+    const range = sheet.getRange(rowNumber, 1, 1, values.length);
+    if (!range.canEdit()) throw new Error('Нет доступа к новой строке.');
+    props.setProperty(key, JSON.stringify({row: rowNumber, state: 'pending', time: Date.now()}));
+    try { range.setValues([values]); SpreadsheetApp.flush(); }
+    catch (error) {
+      try { range.clearContent(); props.deleteProperty(key); }
+      catch (rollback) { throw new Error('Сбой добавления. Проверьте строку ' + rowNumber + ' перед повторной попыткой.'); }
+      throw new Error('Добавление отменено. Повторите сохранение.');
+    }
+    props.setProperty(key, JSON.stringify({row: rowNumber, state: 'done', time: Date.now()}));
+    const history = Object.entries(props.getProperties()).filter(([k]) => k.startsWith('APPEND_V1_')).map(([k,v]) => [k, JSON.parse(v)]).filter(([,v]) => v.state === 'done').sort((a,b) => b[1].time - a[1].time);
+    history.slice(100).forEach(([k]) => props.deleteProperty(k));
+    return {created: true, rowNumber: rowNumber};
+  } finally { lock.releaseLock(); }
 }

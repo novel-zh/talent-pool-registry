@@ -1,56 +1,103 @@
-# Setup, schema and deployment
+# Установка автономной версии
 
-## Source documents
+Приложение один раз разворачивается в Google Apps Script. Затем пользователь подключает
+свою таблицу ссылкой через интерфейс. Свои названия столбцов или ссылки в код вставлять не нужно.
 
-Use native Google Sheets, rather than Excel files opened in the Google editor.
-Import `examples/main.csv` into a `Main` tab and `examples/analysis.csv` into an `Analysis`
-tab in two separate documents for a synthetic demo. All example identities are fictional.
+## 1. Создайте проект
 
-`SCHEMA_` in `Code.gs` defines supported headings and aliases. The main table needs `Name`
-and `Region`; the analysis table needs `ФИО участника` and `Регион`. Other mapped columns
-provide optional fields. Each source must have exactly one matching header row among its first ten rows.
+Откройте [Google Apps Script](https://script.google.com/home) и создайте новый самостоятельный проект.
+Добавьте файлы с точными именами:
 
-For all editable fields, create columns using the corresponding entries in `SCHEMA_.main.fields`
-and `SCHEMA_.bkr.fields`. The minimal CSVs demonstrate connection and linking, not every optional field.
-
-## Apps Script project
-
-1. Add the two source files and enable the manifest in Project Settings.
-2. Replace `appsscript.json` with the supplied manifest.
-3. In Project Settings → Script Properties set:
-
-| Property | Value |
+| В редакторе Apps Script | Содержимое файла из репозитория |
 | --- | --- |
-| `MAIN_SPREADSHEET_URL` | Main Google Sheet URL or document ID |
-| `BKR_SPREADSHEET_URL` | Analysis Google Sheet URL or document ID |
-| `MAIN_TAB_NAME` | Main tab name; optional if discovery is unambiguous |
-| `BKR_TAB_NAME` | Analysis tab name; optional if discovery is unambiguous |
+| Скрипт `Code` | `Code.gs` |
+| HTML `Index` | `Index.html` |
+| HTML `Model` | `Model.html` |
+| HTML `Client` | `Client.html` |
 
-The values in `config.example.json` are placeholders and are not loaded automatically.
-Do not commit actual URLs, `.clasp.json`, account tokens or copied personnel data.
+В настройках проекта включите отображение манифеста `appsscript.json` и замените его
+содержимым одноимённого файла из репозитория. Все три HTML-файла нужны: Index включает Model и Client.
 
-## Initialize
+## 2. Разверните веб-приложение
 
-Run `initializeEmployeeIds` with editor access to both sources. It creates/fills the
-`Сотрудник_ID` column and links unambiguous names. Existing IDs are preserved. Different people
-must have distinct IDs; the same person in both sources must have the same ID.
-Resolve ambiguous duplicate names manually, then rerun initialization.
-Run `checkConnection` to verify loading.
+Выберите **Развернуть → Новое развёртывание → Веб-приложение**.
 
-## Deploy
+- **Выполнять от имени: пользователь, открывающий приложение.**
+- Доступ: нужная аудитория с Google-аккаунтами; можно ограничить доменом организации.
 
-Deploy → New deployment → Web app. Select **Execute as: User accessing the web app**.
-Choose an audience permitted by your Google account/organization and restrict it to intended users.
-Each user needs appropriate access to both underlying documents. Only editors can change the
-corresponding source; creating a participant needs editor access to both sources.
-The app is not a substitute for the Google documents' sharing controls.
+В манифесте задано `executeAs: USER_ACCESSING`. Проверьте этот параметр в окне развёртывания.
+Режим «от моего имени» не подходит для приложения с личными подключениями пользователей.
+При несовпадении активного пользователя и пользователя выполнения backend откажет в выдаче данных.
 
-After changing code, edit the deployment and select a new version. Refresh the browser.
-Do not publish the working deployment URL in a public README containing personnel data.
+Используются два разрешения:
 
-## Operational notes
+- `spreadsheets` — чтение таблиц и сохранение явно подтверждённых изменений;
+- `userinfo.email` — проверка совпадения активного пользователя и пользователя выполнения.
+  Email не возвращается в интерфейс и не записывается в журналы приложением.
 
-Start with synthetic documents or copies. Back up source documents before initializing IDs.
-Revision checks reject stale edits; reload and reapply them after reviewing external changes.
-Write recovery is best effort across two Sheets. If recovery reports incomplete changes,
-inspect both sources and reconcile them before retrying.
+Возможность внешней публикации и порядок авторизации зависят от настроек Google Workspace
+и OAuth-проекта. Пользователь авторизует приложение своим аккаунтом и должен иметь доступ к файлу.
+
+Справка Google: [веб-приложения](https://developers.google.com/apps-script/guides/web),
+[параметры манифеста](https://developers.google.com/apps-script/manifest/web-app-api-executable),
+[Session](https://developers.google.com/apps-script/reference/base/session).
+
+## 3. Подключите таблицу
+
+1. Откройте опубликованную ссылку веб-приложения.
+2. Вставьте URL Google Таблицы и нажмите «Подключить таблицу».
+3. Если ссылка содержит `gid`, откроется соответствующий лист. Иначе выбирается первый непустой лист.
+4. Приложение покажет найденные столбцы, записи и доступные операции.
+5. В «Источник и лист» можно выбрать другой лист и уточнить строку заголовков.
+
+Работают нативные Google Таблицы. Excel-файл, открытый в редакторе Google, сначала сохраните
+как Google Таблицу. Не нужно открывать исходный документ всем по ссылке: достаточно доступа вашему аккаунту.
+
+Настройка хранится в User Properties данного скрипта. Данные таблицы не кэшируются в общем
+хранилище. «Другая таблица» удаляет текущее подключение пользователя и очищает экран.
+`config.example.json` — только поясняющий пример; приложение его не загружает.
+
+## 4. Требования к данным
+
+Одна строка содержит заголовки, последующие строки — записи. Отдельные пустые строки пропускаются.
+Заголовки могут быть на любом языке. Поля ФИО, регион, ID или уровень не обязательны.
+Для заголовков без названия используются подписи вроде «Столбец D»; дубликаты различаются суффиксом.
+
+Автоопределение выбирает первую непустую строку с несколькими заполненными ячейками
+в первых 20 строках; для одноколоночного листа — первую непустую строку. Если перед таблицей есть
+сложный титульный блок или многоуровневая шапка, выберите нужную строку вручную (1–30).
+Нужен один плоский набор столбцов; сводные таблицы и вложенные разделы могут требовать отдельного листа.
+
+Типы определяются по непустым ячейкам загруженной части. Числа должны быть числами Google Sheets,
+даты — датами, флажки — логическими значениями. Текст, похожий на дату, не преобразуется автоматически.
+Если типы смешаны, используется текст. Небольшие текстовые наборы становятся списками фильтра.
+При изменении листа или схемы устаревшие фильтры сбрасываются.
+
+В `examples/main.csv` и `examples/analysis.csv` находятся два независимых вымышленных примера
+с разными наборами столбцов. Импортируйте их на разные листы и проверьте переключение.
+Они не должны объединяться друг с другом по ФИО.
+
+## 5. Изменение записей
+
+Просмотр не меняет документ. Запись происходит только после нажатия «Сохранить» в форме.
+Существующие формулы защищены от редактирования. Для записи повторно проверяются права
+целевых ячеек и версия исходной строки. Внешние изменения приводят к предложению обновить данные.
+
+Новая запись добавляется после последней заполненной строки, без копирования формул и оформления.
+При сбое приложение пытается восстановить исходные значения или убрать незавершённую новую строку.
+Если восстановление не закончено, проверьте указанную строку в Google Таблице вручную.
+Сохранённые номера последних 100 завершённых запросов добавления защищают повторные попытки от дублей.
+Для незавершённой попытки требуется ручная проверка, вместо автоматического повторного добавления.
+
+Из-за ограничений Apps Script чтение ограничено 5 000 строками после заголовка, 100 столбцами,
+100 000 ячеек и примерно 2 млн видимых символов. При частичном чтении фильтры не охватывают остальную таблицу.
+
+## Обновление старой версии
+
+Замените Code и Index, добавьте Model и Client, обновите манифест и создайте новую версию
+существующего развёртывания. Старые свойства `MAIN_SPREADSHEET_URL`, `BKR_SPREADSHEET_URL`
+и `*_TAB_NAME` больше не используются. Запускать `initializeEmployeeIds` не нужно.
+Ранее существовавшие столбцы с ID не удаляются и отображаются как обычные данные.
+
+Если требуется прежнее объединение двух специально настроенных таблиц, исходная версия сохранена
+в истории Git. Новая версия показывает один выбранный лист и не угадывает связи между людьми.

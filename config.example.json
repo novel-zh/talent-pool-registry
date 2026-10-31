@@ -1,6 +1,7 @@
 {
-  "MAIN_SPREADSHEET_URL": "YOUR_MAIN_GOOGLE_SHEET_URL",
-  "BKR_SPREADSHEET_URL": "YOUR_ANALYSIS_GOOGLE_SHEET_URL",
-  "MAIN_TAB_NAME": "Main",
-  "BKR_TAB_NAME": "Analysis"
+  "setup": "No Script Properties are required. Connect through the application interface.",
+  "source": "Paste your Google Sheets URL in the connection screen.",
+  "worksheet": "Choose a worksheet in Source and sheet.",
+  "headerRow": "Automatic; can be overridden with a row number from 1 to 30.",
+  "note": "Documentation example only. This JSON file is not loaded by the app."
 }

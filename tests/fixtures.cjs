@@ -1,17 +1,15 @@
-const fs=require('fs'),vm=require('vm');
-const context=vm.createContext({});
-vm.runInContext(fs.readFileSync(require('path').join(__dirname,'../Code.gs'),'utf8'),context);
-const schema=vm.runInContext('SCHEMA_',context);
-module.exports=['main','bkr'].map((kind,index)=>{
- const fields=Object.keys(schema[kind].fields);
- const headers=fields.map(k=>schema[kind].fields[k][0]);
- const prefix=index===0?[['Synthetic test register'],[],[],headers]:[headers];
- const rows=Array.from({length:index===0?79:81},(_,i)=>fields.map(k=>{
-  if(k==='name'||k==='analysisName')return 'Synthetic Person '+String(i+1).padStart(3,'0');
-  if(k==='region'||k==='analysisRegion')return 'Example Region';
-  if(k==='email')return 'person'+(i+1)+'@example.invalid';
-  if(k==='number'||k==='analysisNumber')return String(i+1);
-  return '';
- }));
- return {name:index===0?'Main':'Analysis',rows:[...prefix,...rows]};
-});
+// Fictional source documents only. No working spreadsheet IDs or personnel records.
+module.exports = () => [
+  {id:'SYNTHETIC_MAIN_0123456789',name:'Вымышленный резерв',sheets:[
+    {id:0,name:'Участники',rows:[
+      ['Кадровый резерв — пример'],[],
+      ['ФИО','Регион','Баллы','Дата включения','Активен','Телефон','','Регион','Итог'],
+      ['Участник 01','Астана',50,new Date('2026-01-15T00:00:00Z'),true,{value:123,display:'00123'},'Заметка','Север',{value:90,formula:'=45*2'}],
+      ['Участник 02','Алматы',0,new Date('2026-02-15T00:00:00Z'),false,{value:456,display:'00456'},'','Юг',80],
+      [],['Участник 03','Астана',100,'','',789,'Текст','Север',75]
+    ]},
+    {id:42,name:'Иные поля',rows:[['Проект','Статус'],['Пример проекта','В работе']]},
+    {id:99,name:'Пустой',rows:[]}
+  ]},
+  {id:'SYNTHETIC_OTHER_0123456789',name:'Другой источник',sheets:[{id:0,name:'Реестр',rows:[['Name','Skill'],['Example Person','Research']]}]}
+];
