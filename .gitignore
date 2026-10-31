@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.clasp.json
+.clasprc.json
+node_modules/
+work/
+private/
+*.xlsx
+*.xls
+*.response.json
+.DS_Store
+Thumbs.db
