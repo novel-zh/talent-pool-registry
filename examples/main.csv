@@ -1,3 +1,4 @@
-﻿Name,Region,Stufe,Kontaktnummer,E-Mail,Сотрудник_ID
-Example Person 01,Example Region,1,,person01@example.invalid,EMP-DEMO-001
-Example Person 02,Example Region,2,,person02@example.invalid,EMP-DEMO-002
+ФИО,Регион,Направление,Баллы,Дата включения,Обучение завершено,План развития
+Участник 01,Астана,Управление,80,2026-01-15,TRUE,Практика и обучение
+Участник 02,Алматы,Образование,0,2026-02-15,FALSE,
+Участник 03,Астана,Проекты,95,2026-03-15,TRUE,Пример плана
