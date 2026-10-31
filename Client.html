@@ -10,7 +10,7 @@
       if (!hasServer) return reject(new Error('Для подключения своей таблицы откройте опубликованное веб-приложение. Здесь доступен пример.'));
       const runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(error => reject(new Error(error.message || 'Не удалось выполнить запрос.')));
       if (!['getInitialState','connectSpreadsheet','selectSheet','refreshDataset','disconnectSpreadsheet','saveRow','appendRow'].includes(method)) return reject(new Error('Неизвестная операция.'));
-      runner[method](payload);
+      if(payload===undefined)runner[method]();else runner[method](payload);
     });
   }
   function message(id,text) { $(id).textContent=text||''; $(id).hidden=!text; }
