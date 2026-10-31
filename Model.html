@@ -1,0 +1,37 @@
+<script>
+window.RegistryModel = (() => {
+  const normalize = v => String(v ?? '').normalize('NFKC').toLocaleLowerCase().replace(/\s+/g, ' ').trim();
+  const empty = v => v === null || v === undefined || String(v).trim() === '';
+  const valueOf = (row, col) => col.type === 'text' ? row.values[col.key] : row.typed[col.key];
+  function filterRows(data, query, filters) {
+    const words = normalize(query).split(' ').filter(Boolean);
+    return data.rows.filter(row => words.every(word => normalize(Object.values(row.values).join(' ')).includes(word)) && filters.every(f => {
+      const col = data.columns.find(c => c.key === f.key); if (!col) return true;
+      const shown = row.values[col.key], value = valueOf(row, col);
+      if (f.op === 'empty') return empty(shown);
+      if (f.op === 'notEmpty') return !empty(shown);
+      if (col.type === 'number' || col.type === 'date') {
+        if (empty(f.min) && empty(f.max)) return true;
+        if (empty(value)) return false;
+        const cast = v => col.type === 'number' ? Number(v) : String(v);
+        return (empty(f.min) || cast(value) >= cast(f.min)) && (empty(f.max) || cast(value) <= cast(f.max));
+      }
+      if (col.type === 'boolean') return empty(f.value) || String(value) === f.value;
+      if (empty(f.value)) return true;
+      return f.op === 'is' ? String(shown) === f.value : normalize(shown).includes(normalize(f.value));
+    }));
+  }
+  function sortRows(rows, columns, key, direction = 'asc') {
+    const col = columns.find(c => c.key === key); if (!col) return rows.slice();
+    return rows.slice().sort((a,b) => {
+      const av = valueOf(a,col), bv = valueOf(b,col);
+      if (empty(av) && empty(bv)) return a.rowNumber - b.rowNumber;
+      if (empty(av)) return 1; if (empty(bv)) return -1;
+      const result = col.type === 'number' ? Number(av)-Number(bv) : col.type === 'boolean' ? Number(av)-Number(bv) : String(av).localeCompare(String(bv),'ru',{numeric:true});
+      return result ? result * (direction === 'desc' ? -1 : 1) : a.rowNumber-b.rowNumber;
+    });
+  }
+  function pageRows(rows,page,size) { const pages=Math.max(1,Math.ceil(rows.length/size)),current=Math.max(1,Math.min(page,pages));return {rows:rows.slice((current-1)*size,current*size),page:current,pages}; }
+  return {normalize,empty,valueOf,filterRows,sortRows,pageRows};
+})();
+</script>

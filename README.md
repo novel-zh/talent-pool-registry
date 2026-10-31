@@ -1,82 +1,116 @@
 # Talent Pool Registry
 
-**A Google Apps Script web app for working with personnel and talent-development data in Google Sheets.**
+**Paste a Google Sheets link. Get searchable profiles and filters built from your own columns.**
 
 [Русская версия](README.ru.md) · [Setup guide](docs/setup.md)
 
-![Participant editor with synthetic demonstration data](docs/images/participant-editor.png)
+![Connect a Google Sheet by URL](docs/images/connection-screen.png)
 
-The app brings a main personnel register and a development-analysis sheet into one searchable
-interface. Users can open profiles, filter the list and edit supported fields without working
-directly in a wide spreadsheet.
+A standalone Google Apps Script web app for working with talent pool records and other tabular data.
+The GitHub edition adapts to the connected sheet: it no longer requires two particular documents,
+predefined Russian/German headings, Script Properties or an employee-ID initialization step.
 
-## Features
+## How to use it
 
-- A responsive list with filters, pagination and expandable profiles.
-- A unified editor and a form for creating participants.
-- Stable `Сотрудник_ID` identifiers link records across two source tables.
-- Per-source editing permissions based on the signed-in user's spreadsheet access.
-- Revision checks catch stale edits before writing; guarded writes attempt rollback on failure.
-- Literal text handling protects editable text fields from accidental spreadsheet formulas.
-- One page scroll, mobile layouts and a back-to-top control.
+1. Deploy the app once in Google Apps Script using the [setup guide](docs/setup.md).
+2. Open the app, sign in to Google and paste a Google Sheets URL.
+3. The app detects a header row, discovers the available columns and builds the interface.
+4. Search across all fields, add filters for any column, open a full record or select another worksheet.
 
-## Quick start
+Users need access to their source document. Each user's connection is stored privately in User Properties;
+there is no shared document URL or shared personnel cache. Connecting reads the sheet without adding ID columns.
 
-1. Create two **Google Sheets** documents. The synthetic CSVs in `examples/` can seed a demo.
-2. Create an Apps Script project with `Code.gs`, `Index.html` and `appsscript.json`.
-3. Add Script Properties using the keys shown in `config.example.json`.
-4. Run `initializeEmployeeIds` as an editor of both tables, then `checkConnection`.
-5. Deploy as a web app **executing as the user accessing the web app**.
-6. Restrict deployment access to the intended audience and share the source Sheets with those users.
+## What adapts automatically
 
-See [setup](docs/setup.md) for schema mapping, permissions and updates.
-Configuration JSON is a reference; it is not imported automatically.
-
-## How it works
-
-```mermaid
-flowchart LR
-    A[Signed-in user] --> B[Apps Script web app]
-    B --> C[Main register in Google Sheets]
-    B --> D[Development analysis in Google Sheets]
-    C --- E[Shared employee ID]
-    D --- E
-```
-
-| File | Purpose |
+| Data found in a column | Generated filter |
 | --- | --- |
-| `Code.gs` | Sheet discovery, stable IDs, access checks, validation and writes |
-| `Index.html` | Responsive client and editing forms |
-| `appsscript.json` | V8 runtime and spreadsheet scope |
-| `examples/` | Small, entirely synthetic tables |
+| Text with a short list of distinct values | Dropdown |
+| Free text or a name | Text search |
+| Numeric cells | Minimum / maximum |
+| Google Sheets date cells | Date range |
+| Boolean cells / checkboxes | Yes / no |
+| Any column | Empty / not empty |
 
-## Deployment and limitations
+Headers become field labels. Duplicate and unnamed columns receive distinct display labels while retaining
+their physical column positions. Mixed-type columns fall back to text. Phone numbers and identifier-like
+columns retain their displayed text, including formatting such as leading zeroes.
 
-Google Apps Script and Google Sheets provide the runtime and storage; there is no separate database server.
-The deployment must execute as the accessing user for per-user spreadsheet permissions to apply.
-Changing it to execute as the owner changes the access model.
+The first plausible multi-cell row among the first 20 rows is used as the header. You can override it
+under **Source and sheet** (rows 1–30). Complex merged or multi-level headings can require this adjustment.
 
-Initialization writes stable IDs to the tables. Review duplicate names first; ambiguous matches are rejected.
-Use test copies for initial setup. Cross-file rollback is best effort, rather than a database transaction;
-an incomplete rollback can require manual reconciliation. Existing formula cells are protected from editing.
+![Generated profiles and filters, using fictional data](docs/images/participant-editor.png)
 
-The configured column names include German and Russian headings. Adapt `SCHEMA_` for a different layout.
-This is a record-management tool; it does not rank participants or make employment decisions.
+## Other features
 
-## Privacy and licensing
+- All-field search, sortable columns, pagination and selectable list columns.
+- Expandable profiles containing every discovered field; mobile card layouts.
+- Dynamic editing and creation forms, subject to Google Sheets edit permissions.
+- Existing formula cells are read-only. Stale row/schema revisions reject conflicting edits.
+- Failed writes attempt recovery; creation retries are deduplicated for the last 100 completed requests per user.
+- Explicit in-memory demo mode with fictional data; connection errors never silently load demo records.
 
-The repository contains code and synthetic examples only. It does not contain actual personnel records,
-source sheet URLs or deployment IDs. Keep production documents, exports and account credentials outside Git.
-Do not deploy personnel data for anonymous public access.
+## Install
 
-No open-source license has been selected for this project yet.
+Copy these five files into a standalone Apps Script project:
 
-## Local regression checks
+- `Code.gs`
+- `Index.html`
+- `Model.html`
+- `Client.html`
+- `appsscript.json`
 
-The backend regression checks run against in-memory Sheets mocks and generated synthetic records.
-They cover stable IDs, permissions, stale edits, validation, rollback and creation retries.
-Node.js is required. They do not call Google services or replace a deployment smoke test.
+Deploy as a web app **executing as the user accessing the web app**. The manifest selects
+`USER_ACCESSING`; verify that choice in the deployment dialog. Each user authorizes the app and works
+with their own spreadsheet permissions. A runtime identity check rejects execution under a different user's authority.
+
+There is no separate server to install. This is an Apps Script app, rather than a static GitHub Pages app:
+opening the HTML locally supports the fictional demo, but connecting a private sheet requires the deployed app.
+
+## Limits and data integrity
+
+One worksheet is displayed at a time; worksheets are not automatically joined by names or IDs.
+Use one header row and one record per row. Empty sheets require headers before connecting.
+Reads are bounded to 5,000 source rows, 100 columns, 100,000 cells and about two million display characters.
+When the read is partial, the app explicitly warns that filters cover the loaded portion only.
+
+Edits use the current physical row number plus a revision of its values, formulas and schema. They do not
+create stable identifiers in the source. External changes and row movement generally require a refresh.
+Writes are not database transactions: incomplete recovery may need manual reconciliation.
+New records do not copy source formulas or formatting. Protected ranges can make the loaded block read-only.
+
+## Development and checks
+
+No dependencies are needed for the backend and filtering regression checks:
 
 ```sh
 node tests/backend.cjs
+node tests/model.cjs
 ```
+
+Optional browser checks use Playwright:
+
+```sh
+npm install --no-save --package-lock=false playwright
+npx playwright install chromium
+node tests/ui.cjs
+```
+
+Tests use generated or fictional records and mocked Apps Script services. They cover schema discovery,
+per-user isolation, type inference, permissions, conflicts, recovery, filters, responsive UI and escaping.
+They do not substitute for authorizing and smoke-testing an actual Apps Script deployment.
+
+## Repository
+
+| Path | Purpose |
+| --- | --- |
+| `Code.gs` | Per-user connection, sheet discovery, schema inference and guarded writes |
+| `Index.html` | Responsive connection screen, registry and forms |
+| `Model.html` | Filtering, sorting and pagination |
+| `Client.html` | Browser interaction and explicit synthetic demo |
+| `examples/` | Two unrelated fictional schemas for trying different columns |
+| `tests/` | Portable backend, model and optional UI checks |
+
+The repository contains no real personnel data, source sheet URLs or account credentials.
+The email scope is used only to verify that the active user and execution user match; the app does not
+return or log those email addresses. Do not deploy personnel data for anonymous access.
+No open-source license has been selected for this project yet.
